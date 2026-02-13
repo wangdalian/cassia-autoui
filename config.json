@@ -1,0 +1,50 @@
+{
+    "base_url": "http://10.100.144.168:8882",
+
+    "browser_mode": "persistent",
+    "cdp_url": "http://localhost:9222",
+
+    "ac_username": "admin",
+    "ac_password": "1q2w#E$R",
+
+    "blue_password": "YuBC5Lp1kX",
+    "su_password": "$$33bRx2S",
+
+    "auto_fetch_gateways": true,
+
+    "gateway_macs": [
+        "CC:1B:E0:E2:E9:B8"
+    ],
+
+    "shell_commands": [
+        "show version",
+        "cat /sys/block/mmcblk0/device/name",
+        "/sbin/mmc extcsd read /dev/mmcblk0 | grep -E 'Life Time|EOL'"
+    ],
+
+    "command_parsers": [
+        {
+            "command": "cat /sys/block/mmcblk0/device/name",
+            "extract": {
+                "devName": "^\\s*(.+?)\\s*$"
+            }
+        },
+        {
+            "command": "/sbin/mmc extcsd read /dev/mmcblk0 | grep -E 'Life Time|EOL'",
+            "extract": {
+                "EST_TYP_A": "EST_TYP_A\\]:\\s*(0x[0-9a-fA-F]+)",
+                "EST_TYP_B": "EST_TYP_B\\]:\\s*(0x[0-9a-fA-F]+)",
+                "EOL_INFO": "EOL_INFO\\]:\\s*(0x[0-9a-fA-F]+)"
+            }
+        }
+    ],
+
+    "log_level": "INFO",
+
+    "timeout_page_load": 30000,
+    "timeout_terminal_ready": 30000,
+    "timeout_prompt_wait": 30000,
+    "timeout_command_wait": 30000,
+    "type_delay": 50,
+    "devtools": false
+}
