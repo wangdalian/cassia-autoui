@@ -45,6 +45,48 @@ COLUMN_HEADERS = {
 }
 
 
+AP_LIST_FILE = os.path.join(RESULTS_DIR, "ap_list.json")
+
+# 需要从 ap_list.json 兜底补充的元数据字段
+METADATA_FIELDS = ["name", "sn", "status", "uplink", "version", "containerVersion", "appVersion"]
+
+
+def _load_ap_lookup() -> dict:
+    """
+    加载 ap_list.json，返回 {mac: {元数据字段}} 的查找表。
+    提取逻辑与 emmc_auto_check.py 的 extract_gateway_info() 一致。
+    """
+    if not os.path.isfile(AP_LIST_FILE):
+        return {}
+    try:
+        with open(AP_LIST_FILE, "r", encoding="utf-8") as f:
+            raw_list = json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+    lookup = {}
+    for gw in raw_list:
+        mac = gw.get("mac", "")
+        if not mac:
+            continue
+        container = gw.get("container") or {}
+        apps = container.get("apps", [])
+        app_version = ""
+        if isinstance(apps, list) and apps:
+            app = apps[0]
+            app_version = f"{app.get('name', '')}.{app.get('version', '')}"
+        lookup[mac] = {
+            "name": gw.get("name", ""),
+            "sn": gw.get("reserved3", ""),
+            "status": gw.get("status", ""),
+            "uplink": (gw.get("ap") or {}).get("uplink", ""),
+            "version": gw.get("version", ""),
+            "containerVersion": container.get("version", ""),
+            "appVersion": app_version,
+        }
+    return lookup
+
+
 def main():
     if not os.path.isdir(GATEWAYS_DIR):
         print(f"[错误] 网关结果目录不存在: {GATEWAYS_DIR}")
@@ -75,6 +117,31 @@ def main():
     if not all_results:
         print("[错误] 没有有效的结果数据")
         sys.exit(1)
+
+    # 从 ap_list.json 兜底补充缺失的元数据
+    ap_lookup = _load_ap_lookup()
+    if ap_lookup:
+        patched_count = 0
+        for row in all_results:
+            mac = row.get("mac", "")
+            if mac and mac in ap_lookup:
+                ap_info = ap_lookup[mac]
+                patched = False
+                for field in METADATA_FIELDS:
+                    if not row.get(field) and ap_info.get(field):
+                        row[field] = ap_info[field]
+                        patched = True
+                if patched:
+                    patched_count += 1
+        if patched_count:
+            print(f"  已从 ap_list.json 补充 {patched_count} 条记录的缺失元数据")
+    else:
+        print("  [提示] 未找到 ap_list.json，跳过元数据兜底补充")
+
+    # 重新收集所有字段（补充后可能新增了字段）
+    all_fields = set()
+    for row in all_results:
+        all_fields.update(row.keys())
 
     # 生成有序列名：优先列 + 其余列按字母序
     priority_set = set(PRIORITY_COLUMNS)

@@ -1105,7 +1105,7 @@ def process_gateway(context: BrowserContext, page: Page, gw_info: dict, index: i
     # 人工操作模式
     # page.wait_for_timeout(30000000)
 
-    for attempt in range(2):  # 最多尝试 2 次（首次 + 重试 1 次）
+    for attempt in range(3):  # 最多尝试 3 次（支持复合故障：如网络异常重试后又遇会话过期）
         try:
             # 每次尝试都重置终端捕获器，避免残留数据导致误匹配
             if _terminal_capture is not None:
@@ -1139,9 +1139,9 @@ def process_gateway(context: BrowserContext, page: Page, gw_info: dict, index: i
             return True  # 成功
 
         except Exception as e:
-            if attempt == 0 and _is_session_expired_error(e):
-                # 首次失败且疑似会话过期，自动重登录后重试
-                logger.warning(f"\n[{index}/{total}] 网关 {display} 疑似会话过期，自动重新登录后重试...")
+            if attempt < 2 and _is_session_expired_error(e):
+                # 疑似会话过期，自动重登录后重试
+                logger.warning(f"\n[{index}/{total}] 网关 {display} 疑似会话过期（第{attempt+1}次），自动重新登录后重试...")
                 logger.warning(f"  原始错误: {e}")
                 try:
                     page.goto(f"{BASE_URL}/dashboard?view", timeout=TIMEOUT_PAGE_LOAD)
@@ -1151,9 +1151,9 @@ def process_gateway(context: BrowserContext, page: Page, gw_info: dict, index: i
                 login_ac(page)
                 continue  # 重试
 
-            if attempt == 0 and _is_network_error(e):
-                # 首次失败且疑似网络问题，等待后重试
-                logger.warning(f"\n[{index}/{total}] 网关 {display} 疑似网络异常，等待 5 秒后重试...")
+            if attempt < 2 and _is_network_error(e):
+                # 疑似网络问题，等待后重试
+                logger.warning(f"\n[{index}/{total}] 网关 {display} 疑似网络异常（第{attempt+1}次），等待 5 秒后重试...")
                 logger.warning(f"  原始错误: {e}")
                 try:
                     page.wait_for_timeout(5000)
@@ -1167,11 +1167,14 @@ def process_gateway(context: BrowserContext, page: Page, gw_info: dict, index: i
                         pass
                 continue  # 重试
 
-            # 非可恢复问题，或已重试过仍失败
+            # 已用完重试次数，或非可恢复错误
+            error_msg = str(e)
             logger.error(f"\n[{index}/{total}] 网关 {display} 处理失败 ✗")
             logger.error(f"  错误: {e}")
             traceback.print_exc()
-            return False
+            # 即使失败也保存已有的元数据（version/containerVersion 等）
+            _save_gateway_result(mac, gw_info, {"_error": error_msg})
+            return error_msg  # 返回错误信息（非 True 即失败）
 
         finally:
             # 导航回 dashboard，为下一个网关做准备
@@ -1181,7 +1184,9 @@ def process_gateway(context: BrowserContext, page: Page, gw_info: dict, index: i
             except Exception:
                 pass
 
-    return False
+    # 重试次数用尽仍失败，也保存已有的元数据
+    _save_gateway_result(mac, gw_info, {"_error": "重试次数用尽仍失败"})
+    return "重试次数用尽仍失败"
 
 
 MODE_LABELS = {
@@ -1344,12 +1349,28 @@ def main():
         # 逐个处理网关
         success_count = 0
         fail_count = 0
+        failed_gateways = []  # 收集失败网关信息
 
         for i, gw_info in enumerate(gateways, 1):
-            if process_gateway(context, page, gw_info, i, total):
+            result = process_gateway(context, page, gw_info, i, total)
+            if result is True:
                 success_count += 1
             else:
                 fail_count += 1
+                # result 为错误信息字符串；记录完整的 gw_info 元数据
+                failed_gateways.append({
+                    **gw_info,  # 包含 mac, name, sn, version, containerVersion, appVersion 等
+                    "error": result if isinstance(result, str) else "未知错误",
+                })
+
+        # 保存失败网关到文件
+        if failed_gateways:
+            fail_dir = os.path.join(SCRIPT_DIR, "emmc_results")
+            os.makedirs(fail_dir, exist_ok=True)
+            fail_path = os.path.join(fail_dir, "failed_gateways.json")
+            with open(fail_path, "w", encoding="utf-8") as f:
+                json.dump(failed_gateways, f, ensure_ascii=False, indent=2)
+            logger.info(f"失败网关已保存: {fail_path}（{len(failed_gateways)} 条）")
 
         # 输出汇总
         logger.info(f"\n{'='*60}")
@@ -1357,6 +1378,10 @@ def main():
         logger.info(f"  总数: {total}")
         logger.info(f"  成功: {success_count}")
         logger.info(f"  失败: {fail_count}")
+        if failed_gateways:
+            logger.info(f"  失败网关列表:")
+            for fg in failed_gateways:
+                logger.info(f"    - {fg['mac']} ({fg['name'] or '未命名'}): {fg['error']}")
         logger.info(f"{'='*60}")
 
         # 保持浏览器窗口打开
