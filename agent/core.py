@@ -73,7 +73,8 @@ class CassiaAgent:
 
         # 核心组件
         diff_threshold = agent_config.get("diff_threshold", 0.6)
-        self.snapshot = SnapshotParser(diff_threshold=diff_threshold)
+        snapshot_max_lines = agent_config.get("snapshot_max_lines", None)
+        self.snapshot = SnapshotParser(diff_threshold=diff_threshold, max_lines=snapshot_max_lines)
         self.executor = ToolExecutor(page, self.snapshot, config)
 
         # 对话历史

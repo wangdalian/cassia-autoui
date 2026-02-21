@@ -45,13 +45,17 @@ class SnapshotParser:
         parser.reset()                                # 页面导航后重置
     """
 
-    def __init__(self, diff_threshold: float = 0.6):
+    MAX_SNAPSHOT_LINES = 200
+
+    def __init__(self, diff_threshold: float = 0.6, max_lines: int | None = None):
         """
         Args:
             diff_threshold: 变化比例阈值。
                 变化 < threshold → 发 diff;  >= threshold → 发全量。
+            max_lines: 快照最大行数，超出时截断。None 使用类默认值。
         """
         self._diff_threshold = diff_threshold
+        self._max_lines = max_lines or self.MAX_SNAPSHOT_LINES
         self._counter = 0
         self._ref_map: dict[int, dict] = {}  # ref -> {role, name, value, ...}
         self._last_tree: dict | None = None   # 上次快照的原始树
@@ -90,6 +94,13 @@ class SnapshotParser:
         self._ref_map = {}
         self._role_name_count = {}
         text_lines = self._walk(tree, depth=0)
+        if len(text_lines) > self._max_lines:
+            omitted = len(text_lines) - self._max_lines
+            text_lines = text_lines[:self._max_lines]
+            text_lines.append(
+                f"... (省略 {omitted} 行，页面元素较多。建议使用搜索框缩小范围)"
+            )
+            logger.debug(f"[Snapshot] 快照截断: {omitted} 行被省略 (上限 {self._max_lines})")
         current_text = "\n".join(text_lines)
         current_elements = self._flatten_to_dict(tree)
 
