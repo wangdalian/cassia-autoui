@@ -21,6 +21,15 @@ from agent.prompts import build_system_prompt
 logger = logging.getLogger("cassia")
 
 
+def _fmt_size(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    elif n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    else:
+        return f"{n / (1024 * 1024):.1f} MB"
+
+
 class CassiaAgent:
     """
     Cassia AC 管理平台 AI Agent。
@@ -250,6 +259,11 @@ class CassiaAgent:
                     reasoning_chunk = getattr(delta, "reasoning_content", None)
                     if reasoning_chunk:
                         reasoning_parts.append(reasoning_chunk)
+                        if self._on_thinking_chunk:
+                            if not has_started_thinking:
+                                has_started_thinking = True
+                                self._on_thinking_chunk("\n")
+                            self._on_thinking_chunk(reasoning_chunk)
 
                     # 累积文本内容
                     if delta.content:
@@ -277,8 +291,17 @@ class CassiaAgent:
                             if tc_delta.function:
                                 if tc_delta.function.name:
                                     tool_calls_acc[idx]["function"]["name"] = tc_delta.function.name
+                                    if self._on_thinking_chunk:
+                                        self._on_thinking_chunk(f"\n  -> {tc_delta.function.name}(...)")
                                 if tc_delta.function.arguments:
                                     tool_calls_acc[idx]["function"]["arguments"] += tc_delta.function.arguments
+                                    if self._on_thinking_chunk:
+                                        name = tool_calls_acc[idx]["function"]["name"]
+                                        size = len(tool_calls_acc[idx]["function"]["arguments"])
+                                        if size > 512:
+                                            self._on_thinking_chunk(
+                                                f"\r  -> {name}(...) [{_fmt_size(size)}]"
+                                            )
             except Exception as stream_err:
                 stream_interrupted = True
                 logger.warning(f"[Agent] 流式传输中断: {stream_err}")

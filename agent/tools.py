@@ -320,6 +320,28 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    # ---- 本地文件 ----
+    {
+        "type": "function",
+        "function": {
+            "name": "write_local_file",
+            "description": "将内容写入本地文件。用于保存分析报告、导出数据等。文件保存在 Agent 运行目录下的 reports/ 文件夹中。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {
+                        "type": "string",
+                        "description": "文件名（如 gateway_report.html、analysis.md）。不需要路径前缀。",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "文件内容",
+                    },
+                },
+                "required": ["filename", "content"],
+            },
+        },
+    },
     # ---- 结束任务 ----
     {
         "type": "function",
@@ -778,6 +800,17 @@ class ToolExecutor:
             header += f"匹配 {total_matches} 条:"
 
         return f"{header}\n\n{result_str}"
+
+    # ---- 本地文件 ----
+
+    def _tool_write_local_file(self, filename: str, content: str) -> str:
+        reports_dir = "reports"
+        os.makedirs(reports_dir, exist_ok=True)
+        safe_name = os.path.basename(filename)
+        path = os.path.join(reports_dir, safe_name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+        return f"文件已保存: {path} ({len(content)} 字符)"
 
     # ---- 结束任务 ----
 

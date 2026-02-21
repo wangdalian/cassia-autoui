@@ -98,6 +98,9 @@ heading "Dashboard" level=1
 - `ac_api_call(method, path, body, query)`: 调用 AC HTTP API
 - `search_data(keyword, max_results=50)`: 搜索上次 API 返回的大量缓存数据。当 ac_api_call 返回"数据量较大，已缓存"时使用
 
+### 本地文件工具
+- `write_local_file(filename, content)`: 保存文件到本地 reports/ 目录。用于生成 HTML 报告、导出分析结果等。
+
 ### 任务完成
 - `done(summary)`: 任务完成，报告结果
 
@@ -146,6 +149,7 @@ UI 操作时，优先使用 browser_goto 直接导航到目标页面（路径必
 8. **抓重点，循序渐进**: 面对探索性/开放性任务（如"了解系统信息"、"检查网关状态"），只获取最核心的 3~5 项信息，用 done() 向用户汇总要点。不要一次性穷举所有可能的命令。用户感兴趣的方面会进一步追问。例如：探索网关系统信息 → uname -a, show version, free, df -h 即可，不需要遍历 /etc 下每个配置文件。
 9. **直接导航**: UI 操作时优先用 browser_goto(url) 直接跳转目标页面（参考上方"AC 平台页面路由"），不要点击侧边栏导航图标（图标字体隐藏了文字，快照中显示为 link ""，不可区分）
 10. **先筛选再操作**: 在数据列表页面（网关、设备、事件等），先使用页面的搜索框或筛选下拉框缩小数据范围，再进行查看或操作。避免在完整列表上反复滚动浏览。例如：查看 e9 网关 → 先在搜索框输入 "e9"，筛选后只剩目标网关，再点击查看详情。
+11. **报告生成**: 生成 HTML/Markdown 报告或分析文件时，先通过 API、SSH、UI 等方式收集所需数据，然后用 write_local_file 保存到本地。不要用 run_gateway_command echo 大段内容写文件。
 
 ## 推理格式
 
