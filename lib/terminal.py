@@ -184,15 +184,18 @@ class TerminalCapture:
         except Exception:
             return
 
-        if result.get('wsDisconnected', False) and not self.ws_disconnected:
+        ws_disconnected_js = result.get('wsDisconnected', False)
+        if ws_disconnected_js and not self.ws_disconnected:
             self.ws_disconnected = True
-            # 从 debug 信息中提取 WS close code/reason，输出到 WARNING
             close_info = ""
             for dbg in result.get('debug', []):
                 if "[WS] close:" in dbg or "[WS] error" in dbg:
                     close_info = f" ({dbg})"
                     break
             logger.warning(f"[TermCapture] WebSocket 连接已断开{close_info}")
+        elif not ws_disconnected_js and self.ws_disconnected:
+            self.ws_disconnected = False
+            logger.info("[TermCapture] WebSocket 已重新连接")
 
         for dbg in result.get('debug', []):
             logger.debug(f"[TermCapture] {dbg}")

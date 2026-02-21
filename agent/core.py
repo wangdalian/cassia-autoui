@@ -200,6 +200,7 @@ class CassiaAgent:
         if self.executor.capture:
             self.executor.capture.reset()
         self.executor._ssh_connected = False
+        self.executor._ws_polling_mode = False
         self.executor.cleanup()  # 清理临时缓存文件
 
     def _call_llm_stream(self) -> tuple[str | None, list[dict] | None, dict | None]:

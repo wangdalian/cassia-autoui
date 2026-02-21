@@ -362,6 +362,7 @@ class ToolExecutor:
         self.config = config
         self.capture = capture
         self._ssh_connected = False
+        self._ws_polling_mode = False
         self._screenshots_dir = "screenshots"
         # 大数据缓存: API 返回大量数据时写入临时文件，供 search_data 工具检索
         self._last_data_file: str | None = None
@@ -467,8 +468,8 @@ class ToolExecutor:
         base_url = self.config["base_url"]
         timeout = self.config.get("timeout_page_load", 30000)
 
-        # 重置连接状态
         self._ssh_connected = False
+        self._ws_polling_mode = False
 
         # 初始化终端捕获器
         if self.capture is None:
@@ -528,10 +529,11 @@ class ToolExecutor:
         except TimeoutError:
             self.page.wait_for_timeout(3000)
 
-        # Socket.IO 有 polling 回退，WS 断连不代表终端不可用
-        # 所有步骤 ($, password, #) 都已成功，信任连接结果
         if self.capture and self.capture.ws_disconnected:
-            logger.info(f"[SSH] WebSocket 已断连，但终端交互正常 (Socket.IO polling 回退)")
+            self._ws_polling_mode = True
+            logger.info("[SSH] WebSocket 已断连，终端通过 Socket.IO polling 正常工作")
+        else:
+            self._ws_polling_mode = False
 
         self._ssh_connected = True
         self.snapshot.reset()  # 进入终端页面后重置 snapshot
@@ -542,9 +544,8 @@ class ToolExecutor:
         if not self._ssh_connected or self.capture is None:
             return "错误: 未连接到网关 SSH，请先调用 ssh_to_gateway"
 
-        # Socket.IO 有 polling 回退，WS 断连不一定代表终端不可用，继续尝试
-        if self.capture.ws_disconnected:
-            logger.warning("[SSH] WebSocket 已断连，尝试继续执行 (Socket.IO 可能使用 polling)")
+        if self.capture.ws_disconnected and not self._ws_polling_mode:
+            logger.warning("[SSH] WebSocket 新断连，尝试继续执行 (Socket.IO 可能回退到 polling)")
 
         # 校验 timeout_ms: LLM 可能传 null/字符串/不合理值
         try:
@@ -564,6 +565,7 @@ class ToolExecutor:
             output = extract_command_output(new_raw, baseline, command)
         except ConnectionError:
             self._ssh_connected = False
+            self._ws_polling_mode = False
             return "错误: SSH 终端 WebSocket 断连，命令执行失败。请重新调用 ssh_to_gateway 连接"
         except TimeoutError:
             self.page.wait_for_timeout(3000)
