@@ -1,11 +1,11 @@
 {
-    "base_url": "http://10.100.144.168:8882",
+    "base_url": "https://uesystems.ac.jigsaw-iotops.com",
 
     "browser_mode": "persistent",
     "cdp_url": "http://localhost:9222",
 
-    "ac_username": "admin",
-    "ac_password": "1q2w#E$R",
+    "ac_username": "lisong",
+    "ac_password": "@Cassia@1983",
 
     "blue_password": "YuBC5Lp1kX",
     "su_password": "$$33bRx2S",
@@ -13,7 +13,13 @@
     "auto_fetch_gateways": true,
 
     "gateway_macs": [
-        "CC:1B:E0:E2:E9:B8"
+        "CC:1B:E0:E4:52:0C",
+        "CC:1B:E0:E4:17:14",
+        "CC:1B:E0:E4:1A:B8",
+        "CC:1B:E0:E4:13:0C",
+        "CC:1B:E0:E5:AD:9C",
+        "CC:1B:E0:E5:AD:3C",
+        "CC:1B:E0:E5:9D:04"
     ],
 
     "shell_commands": [
