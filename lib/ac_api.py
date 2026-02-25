@@ -205,6 +205,7 @@ def extract_gateway_info(gw: dict) -> dict:
     return {
         "mac": gw.get("mac", ""),
         "name": gw.get("name", ""),
+        "model": gw.get("model", ""),
         "sn": gw.get("reserved3", ""),
         "status": gw.get("status", ""),
         "uplink": (gw.get("ap") or {}).get("uplink", ""),

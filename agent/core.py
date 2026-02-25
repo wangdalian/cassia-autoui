@@ -50,6 +50,10 @@ class CassiaAgent:
         on_thinking: Callable[[str], None] | None = None,
         on_thinking_chunk: Callable[[str], None] | None = None,
         on_tool_call: Callable[[str, dict, str], None] | None = None,
+        on_thinking_stream_start: Callable[[], None] | None = None,
+        on_thinking_stream_end: Callable[[str], None] | None = None,
+        on_reasoning_chunk: Callable[[str], None] | None = None,
+        on_confirm_required: Callable[[str, dict, str], bool] | None = None,
     ):
         """
         Args:
@@ -58,6 +62,10 @@ class CassiaAgent:
             on_thinking: LLM 思考完成回调 (full_text) — 非流式 fallback 时使用
             on_thinking_chunk: LLM 思考流式回调 (text_chunk) — 逐字输出
             on_tool_call: 工具调用回调 (tool_name, args, result)
+            on_thinking_stream_start: 流式开始回调 — 首个内容 chunk 前调用
+            on_thinking_stream_end: 流式结束回调 (full_content) — 流式完成后调用
+            on_reasoning_chunk: reasoning 专用流式回调 — 有则优先使用，否则 fallback 到 on_thinking_chunk
+            on_confirm_required: 确认回调 (tool_name, args, preview) -> bool — 高风险操作前请求用户确认
         """
         self.page = page
         self.config = config
@@ -94,9 +102,10 @@ class CassiaAgent:
         self._on_thinking = on_thinking
         self._on_thinking_chunk = on_thinking_chunk
         self._on_tool_call = on_tool_call
-
-        # 追踪最后一次流式输出的完整文本 (用于避免 cli 重复渲染)
-        self.last_streamed_content: str | None = None
+        self._on_thinking_stream_start = on_thinking_stream_start
+        self._on_thinking_stream_end = on_thinking_stream_end
+        self._on_reasoning_chunk = on_reasoning_chunk
+        self._on_confirm_required = on_confirm_required
 
     def run(self, user_instruction: str) -> str:
         """
@@ -108,9 +117,6 @@ class CassiaAgent:
         Returns:
             任务完成的总结文本
         """
-        # 重置流式输出追踪
-        self.last_streamed_content = None
-
         # 获取初始页面快照
         observation = self.snapshot.get_observation(self.page)
 
@@ -122,29 +128,36 @@ class CassiaAgent:
 {observation}"""
 
         self._messages.append({"role": "user", "content": user_message})
+        logger.info(f"[Agent] 用户指令: {user_instruction}")
 
         # ReAct 循环
         for step in range(1, self._max_steps + 1):
-            logger.info(f"[Agent] 第 {step} 步")
+            logger.info(f"[Agent] 第 {step} 步, 消息数={len(self._messages)}")
 
             # 流式调用 LLM
             content, tool_calls, message_dict = self._call_llm_stream()
 
             if message_dict is None:
+                logger.error("[Agent] LLM 返回 None，任务终止")
                 return "LLM 调用失败，任务终止"
 
             # 保存 assistant 消息
             self._messages.append(message_dict)
 
-            # 如果有文本回复: 流式过程中已通过 on_thinking_chunk 逐字输出
+            # 记录 LLM 响应摘要
+            tc_names = [tc["function"]["name"] for tc in (tool_calls or [])]
+            logger.info(
+                f"[Agent] LLM 响应: content_len={len(content) if content else 0}, "
+                f"tool_calls={tc_names or 'None'}"
+            )
             if content:
                 logger.debug(f"[Agent] 思考: {content[:200]}")
 
             # 如果没有 tool_calls，说明 LLM 认为任务完成或需要回复
             if not tool_calls:
-                result = content or "任务完成 (LLM 未返回总结)"
-                self.last_streamed_content = result
-                return result
+                final = content or "任务完成 (LLM 未返回总结)"
+                logger.info(f"[Agent] 无 tool_calls，返回结果: len={len(final)}")
+                return final
 
             # 执行所有 tool calls
             for tc in tool_calls:
@@ -153,8 +166,26 @@ class CassiaAgent:
                     arguments = json.loads(tc["function"]["arguments"])
                 except json.JSONDecodeError:
                     arguments = {}
+                    logger.warning(f"[Agent] 工具参数 JSON 解析失败: {tc['function']['arguments'][:200]}")
 
-                logger.debug(f"[Agent] 调用工具: {tool_name}({json.dumps(arguments, ensure_ascii=False)[:200]})")
+                logger.info(f"[Agent] 调用工具: {tool_name}({json.dumps(arguments, ensure_ascii=False)[:200]})")
+
+                # 确认机制: 检查工具是否需要用户确认
+                preview = self.executor.get_preview(tool_name, arguments)
+                if preview is not None:
+                    if self._on_confirm_required:
+                        confirmed = self._on_confirm_required(tool_name, arguments, preview)
+                        if not confirmed:
+                            logger.info(f"[Agent] 用户取消工具: {tool_name}")
+                            result = "用户取消了操作"
+                            self._messages.append({
+                                "role": "tool",
+                                "tool_call_id": tc["id"],
+                                "content": result,
+                            })
+                            if self._on_tool_call:
+                                self._on_tool_call(tool_name, arguments, result)
+                            continue
 
                 # 执行工具
                 result = self.executor.execute(tool_name, arguments)
@@ -169,6 +200,7 @@ class CassiaAgent:
                     })
                     if self._on_tool_call:
                         self._on_tool_call(tool_name, arguments, summary)
+                    logger.info(f"[Agent] done() 完成: len={len(summary)}")
                     return summary
 
                 # 工具执行后等待页面稳定
@@ -182,7 +214,8 @@ class CassiaAgent:
                 else:
                     result_with_observation = result
 
-                logger.debug(f"[Agent] 工具结果: {result[:200]}")
+                logger.info(f"[Agent] 工具结果: {tool_name} -> len={len(result)}")
+                logger.debug(f"[Agent] 工具结果详情: {result[:300]}")
 
                 if self._on_tool_call:
                     self._on_tool_call(tool_name, arguments, result)
@@ -197,6 +230,7 @@ class CassiaAgent:
             # 上下文压缩
             self._compress_context()
 
+        logger.warning(f"[Agent] 达到最大步数 ({self._max_steps})")
         return f"达到最大步数 ({self._max_steps})，任务未完成"
 
     def add_message(self, role: str, content: str):
@@ -259,19 +293,21 @@ class CassiaAgent:
                     reasoning_chunk = getattr(delta, "reasoning_content", None)
                     if reasoning_chunk:
                         reasoning_parts.append(reasoning_chunk)
-                        if self._on_thinking_chunk:
-                            if not has_started_thinking:
-                                has_started_thinking = True
-                                self._on_thinking_chunk("\n")
+                        if not has_started_thinking:
+                            has_started_thinking = True
+                            if self._on_thinking_stream_start:
+                                self._on_thinking_stream_start()
+                        if self._on_reasoning_chunk:
+                            self._on_reasoning_chunk(reasoning_chunk)
+                        elif self._on_thinking_chunk:
                             self._on_thinking_chunk(reasoning_chunk)
 
                     # 累积文本内容
                     if delta.content:
                         if not has_started_thinking:
                             has_started_thinking = True
-                            # 流式开始前换行
-                            if self._on_thinking_chunk:
-                                self._on_thinking_chunk("\n")
+                            if self._on_thinking_stream_start:
+                                self._on_thinking_stream_start()
                         content_parts.append(delta.content)
                         if self._on_thinking_chunk:
                             self._on_thinking_chunk(delta.content)
@@ -291,26 +327,18 @@ class CassiaAgent:
                             if tc_delta.function:
                                 if tc_delta.function.name:
                                     tool_calls_acc[idx]["function"]["name"] = tc_delta.function.name
-                                    if self._on_thinking_chunk:
-                                        self._on_thinking_chunk(f"\n  -> {tc_delta.function.name}(...)")
                                 if tc_delta.function.arguments:
                                     tool_calls_acc[idx]["function"]["arguments"] += tc_delta.function.arguments
-                                    if self._on_thinking_chunk:
-                                        name = tool_calls_acc[idx]["function"]["name"]
-                                        size = len(tool_calls_acc[idx]["function"]["arguments"])
-                                        if size > 512:
-                                            self._on_thinking_chunk(
-                                                f"\r  -> {name}(...) [{_fmt_size(size)}]"
-                                            )
             except Exception as stream_err:
                 stream_interrupted = True
                 logger.warning(f"[Agent] 流式传输中断: {stream_err}")
                 if has_started_thinking and self._on_thinking_chunk:
                     self._on_thinking_chunk("\n[流式传输中断]\n")
 
-            # 流式结束后换行
-            if has_started_thinking and self._on_thinking_chunk:
-                self._on_thinking_chunk("\n")
+            # 流式结束 — 通知 CLI 停止 Live 渲染
+            full_streamed = "".join(reasoning_parts) + "".join(content_parts)
+            if has_started_thinking and self._on_thinking_stream_end:
+                self._on_thinking_stream_end(full_streamed)
 
             # 组装完整结果
             content = "".join(content_parts) if content_parts else None
@@ -318,6 +346,13 @@ class CassiaAgent:
             tool_calls = (
                 [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
                 if tool_calls_acc else None
+            )
+
+            logger.debug(
+                f"[LLM] 流式完成: reasoning_len={len(reasoning_content) if reasoning_content else 0}, "
+                f"content_len={len(content) if content else 0}, "
+                f"tool_calls={len(tool_calls) if tool_calls else 0}, "
+                f"interrupted={stream_interrupted}"
             )
 
             # 构建 message dict (用于存入对话历史)
@@ -345,7 +380,7 @@ class CassiaAgent:
             if "stream" in err_msg:
                 logger.warning("[Agent] 模型不支持 streaming，回退到非流式调用")
                 return self._call_llm_fallback()
-            logger.error(f"[Agent] LLM 调用失败: {e}")
+            logger.error(f"[Agent] LLM 调用失败: {e}", exc_info=True)
             return None, None, None
 
     def _call_llm_fallback(self) -> tuple[str | None, list[dict] | None, dict | None]:
@@ -400,9 +435,13 @@ class CassiaAgent:
                 ]
                 message_dict["tool_calls"] = tool_calls
 
+            logger.debug(
+                f"[LLM] fallback 完成: content_len={len(content) if content else 0}, "
+                f"tool_calls={len(tool_calls) if tool_calls else 0}"
+            )
             return content, tool_calls, message_dict
         except Exception as e:
-            logger.error(f"[Agent] LLM 调用失败 (fallback): {e}")
+            logger.error(f"[Agent] LLM 调用失败 (fallback): {e}", exc_info=True)
             return None, None, None
 
     def _compress_context(self):

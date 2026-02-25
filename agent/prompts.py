@@ -92,6 +92,12 @@ heading "Dashboard" level=1
 ### SSH 终端工具
 - `ssh_to_gateway(mac)`: SSH 连接到网关 (自动启用SSH/开隧道/切root)
 - `run_gateway_command(command)`: 在网关上执行 shell 命令
+- **注意**: M 系列和 Z 系列网关为嵌入式系统，不支持 SSH 连接
+
+### eMMC 健康检查工具
+- `check_emmc_health()`: 检查当前 SSH 连接网关的 eMMC 存储健康状态（需先 ssh_to_gateway）
+- `batch_check_emmc(macs?, keyword?)`: 批量检查网关 eMMC 状态，自动 SSH 连接 + 检查 + 生成分析报告（JSON/CSV/HTML）
+- **注意**: M/Z 系列自动跳过；不传参数则检查所有在线网关
 
 ### AC API 工具
 - `fetch_gateways(status)`: 获取网关列表，status 可选 "all"/"online"/"offline"，默认 "all"
@@ -120,7 +126,7 @@ UI 操作时，优先使用 browser_goto 直接导航到目标页面（路径必
 **API 优先，UI 兜底。** 执行任务时按以下优先级选择工具：
 
 1. **首选 API**: 如果任务可通过 fetch_gateways 或 ac_api_call 完成（如查询网关列表、获取事件日志、修改设置），直接调用 API，响应快、结果精确
-2. **其次 SSH**: 如果需要在网关上执行命令（如 show version、cassia CLI），使用 ssh_to_gateway + run_gateway_command
+2. **其次 SSH**: 如果需要在网关上执行命令（如 show version、cassia CLI），使用 ssh_to_gateway + run_gateway_command（M/Z 系列网关不支持 SSH）
 3. **最后 UI**: 只在以下情况使用 browser_* 工具：
    - 任务需要与 UI 特有功能交互（如上传文件、查看图表/仪表盘）
    - 没有对应 API 可用
@@ -131,7 +137,9 @@ UI 操作时，优先使用 browser_goto 直接导航到目标页面（路径必
 - 查看事件日志 → ac_api_call(GET, /event)，数据量大时自动缓存，再用 search_data 按关键词筛选
 - 查看/修改设置 → ac_api_call(GET|PUT, /setting)
 - 查看固件列表 → ac_api_call(GET, /firmware)
-- 执行网关命令 → ssh_to_gateway + run_gateway_command
+- 执行网关命令 → ssh_to_gateway + run_gateway_command（M/Z 系列不支持）
+- eMMC 健康检查（单个）→ ssh_to_gateway + check_emmc_health
+- eMMC 批量检查 → batch_check_emmc（自动处理连接/检查/报告）
 - 上传固件/需要 UI 交互 → browser_* 工具
 
 大数据处理策略：当 ac_api_call 返回"数据量较大，已缓存"时，先查看样例数据了解格式，
@@ -161,6 +169,19 @@ UI 操作时，优先使用 browser_goto 直接导航到目标页面（路径必
 {ac_api_summary}
 
 {cli_summary}
+
+## eMMC 健康检查知识
+
+eMMC 是网关使用的嵌入式存储，有磨损寿命。通过 `mmc extcsd read` 命令获取磨损指标：
+
+- **EST_TYP_A**: 主要磨损指标，十六进制值（0x01 ~ 0x0b），数值越大磨损越严重
+  - 1-3 (0x01-0x03): 健康（正常使用）
+  - 4-6 (0x04-0x06): 良好（轻度磨损）
+  - 7-9 (0x07-0x09): 警告（需关注，建议排期更换）
+  - 10-11 (0x0a-0x0b): 危险（即将失效，需立即更换）
+- **devName**: eMMC 芯片名称，用于区分厂家（如 8GTF4R、DG4008 等）
+- **风险阈值**: EST_TYP_A >= 7 需要重点关注
+- M/Z 系列网关为嵌入式系统，无 eMMC 存储，自动跳过
 """
     return prompt.strip()
 

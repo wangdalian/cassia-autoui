@@ -7,10 +7,14 @@ Agent 工具注册表
   2. 领域工具: ssh_to_gateway, run_gateway_command, fetch_gateways, ac_api_call
 """
 
+import csv
 import json
 import logging
 import os
+import re
 import tempfile
+from collections import Counter
+from datetime import datetime
 
 from playwright.sync_api import Page
 
@@ -216,7 +220,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "ssh_to_gateway",
-            "description": "通过 AC 平台 SSH 连接到指定网关。执行: 启用SSH -> 开启隧道 -> 打开Web终端 -> 等待连接 -> 切换root。完成后可用 run_gateway_command 执行命令。",
+            "description": "通过 AC 平台 SSH 连接到指定网关。执行: 启用SSH -> 开启隧道 -> 打开Web终端 -> 等待连接 -> 切换root。完成后可用 run_gateway_command 执行命令。注意: M 系列和 Z 系列网关（嵌入式系统）不支持 SSH。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -247,6 +251,40 @@ TOOL_DEFINITIONS = [
                     },
                 },
                 "required": ["command"],
+            },
+        },
+    },
+    # ---- 领域工具: eMMC 健康检查 ----
+    {
+        "type": "function",
+        "function": {
+            "name": "check_emmc_health",
+            "description": "检查当前已 SSH 连接网关的 eMMC 存储健康状态。需先通过 ssh_to_gateway 连接。返回芯片名称、磨损指标（EST_TYP_A/B、EOL_INFO）和健康等级。M/Z 系列不支持。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "batch_check_emmc",
+            "description": "批量检查网关 eMMC 健康状态。自动获取在线网关列表，逐个 SSH 连接并检查，生成分析报告（JSON/CSV/HTML）。M/Z 系列自动跳过。不传参数则检查所有在线网关。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "macs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "指定要检查的 MAC 地址列表（可选）",
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "模糊匹配网关名称/MAC/型号进行筛选（可选）",
+                    },
+                },
             },
         },
     },
@@ -386,6 +424,7 @@ class ToolExecutor:
         self._ssh_connected = False
         self._ws_polling_mode = False
         self._screenshots_dir = "screenshots"
+        self._gateway_models: dict[str, str] = {}
         # 大数据缓存: API 返回大量数据时写入临时文件，供 search_data 工具检索
         self._last_data_file: str | None = None
         self._last_data_count: int = 0
@@ -409,6 +448,22 @@ class ToolExecutor:
         except Exception as e:
             logger.error(f"[Tool] {tool_name} 执行失败: {e}")
             return f"错误: {e}"
+
+    def get_preview(self, tool_name: str, arguments: dict) -> str | None:
+        """
+        获取工具的预览信息（用于确认机制）。
+
+        如果工具定义了 _preview_<tool_name> 方法，调用并返回预览文本；
+        返回 None 表示该工具不需要用户确认。
+        """
+        handler = getattr(self, f"_preview_{tool_name}", None)
+        if handler is None:
+            return None
+        try:
+            return handler(**arguments)
+        except Exception as e:
+            logger.error(f"[Tool] {tool_name} preview 失败: {e}")
+            return f"预览生成失败: {e}"
 
     # ---- 通用 UI 工具 ----
 
@@ -464,9 +519,43 @@ class ToolExecutor:
 
     # ---- 领域工具: SSH ----
 
+    _SSH_UNSUPPORTED_PREFIXES = ("M", "Z")
+
+    def _check_gateway_ssh_support(self, mac: str) -> str | None:
+        """检查网关型号是否支持 SSH，返回 None 表示支持，否则返回错误信息。"""
+        mac_upper = mac.upper()
+        model = self._gateway_models.get(mac_upper)
+
+        if model is None:
+            try:
+                gateways = ac_fetch_gateways(
+                    self.page, self.config["base_url"],
+                    status="all", timeout=self.config.get("timeout_page_load", 30000),
+                )
+                for gw in gateways:
+                    gw_mac = (gw.get("mac") or "").upper()
+                    gw_model = (gw.get("model") or "").strip()
+                    if gw_mac:
+                        self._gateway_models[gw_mac] = gw_model
+                model = self._gateway_models.get(mac_upper)
+            except Exception as e:
+                logger.warning(f"[SSH] 无法获取网关型号信息，跳过前置检查: {e}")
+                return None
+
+        if model and model[0].upper() in self._SSH_UNSUPPORTED_PREFIXES:
+            return (
+                f"错误: 网关 {mac} 型号为 {model}（{model[0].upper()} 系列），"
+                f"属于嵌入式系统，不支持 SSH 连接。"
+            )
+        return None
+
     def _tool_ssh_to_gateway(self, mac: str) -> str:
+        unsupported = self._check_gateway_ssh_support(mac)
+        if unsupported:
+            return unsupported
+
         max_attempts = 3
-        retry_delays = [2000, 5000]  # 第1次失败后等2s, 第2次失败后等5s
+        retry_delays = [2000, 5000]
 
         for attempt in range(1, max_attempts + 1):
             result = self._ssh_connect_once(mac)
@@ -596,6 +685,374 @@ class ToolExecutor:
 
         return output if output else "(无输出)"
 
+    # ---- 领域工具: eMMC 健康检查 ----
+
+    _EMMC_CMD_DEVNAME = "cat /sys/block/mmcblk0/device/name"
+    _EMMC_CMD_EXTCSD = "/sbin/mmc extcsd read /dev/mmcblk0 | grep -E 'Life Time|EOL'"
+
+    _EMMC_PATTERNS = {
+        "EST_TYP_A": re.compile(r"EST_TYP_A\]:\s*(0x[0-9a-fA-F]+)"),
+        "EST_TYP_B": re.compile(r"EST_TYP_B\]:\s*(0x[0-9a-fA-F]+)"),
+        "EOL_INFO":  re.compile(r"EOL_INFO\]:\s*(0x[0-9a-fA-F]+)"),
+    }
+
+    _EMMC_HEALTH_LEVELS = [
+        (1, 3, "健康"),
+        (4, 6, "良好"),
+        (7, 9, "警告"),
+        (10, 11, "危险"),
+    ]
+
+    @staticmethod
+    def _emmc_health_level(val: int) -> str:
+        for lo, hi, label in ToolExecutor._EMMC_HEALTH_LEVELS:
+            if lo <= val <= hi:
+                return label
+        if val == 0:
+            return "未知"
+        return "危险"
+
+    def _parse_emmc_output(self, devname_output: str, extcsd_output: str) -> dict:
+        """解析 eMMC 命令输出，返回结构化字段。"""
+        result = {}
+
+        devname = devname_output.strip().splitlines()
+        result["devName"] = devname[-1].strip() if devname else "N/A"
+
+        for field, pattern in self._EMMC_PATTERNS.items():
+            m = pattern.search(extcsd_output)
+            result[field] = m.group(1) if m else "N/A"
+
+        typ_a_hex = result.get("EST_TYP_A", "N/A")
+        try:
+            typ_a_val = int(typ_a_hex, 16)
+        except (ValueError, TypeError):
+            typ_a_val = 0
+        result["health_value"] = typ_a_val
+        result["health_level"] = self._emmc_health_level(typ_a_val)
+
+        return result
+
+    def _tool_check_emmc_health(self) -> str:
+        if not self._ssh_connected or self.capture is None:
+            return "错误: 未连接到网关 SSH，请先调用 ssh_to_gateway"
+
+        devname_output = self._tool_run_gateway_command(self._EMMC_CMD_DEVNAME)
+        extcsd_output = self._tool_run_gateway_command(self._EMMC_CMD_EXTCSD)
+
+        parsed = self._parse_emmc_output(devname_output, extcsd_output)
+        return json.dumps(parsed, ensure_ascii=False, indent=2)
+
+    def _get_emmc_target_gateways(
+        self, macs: list[str] | None = None, keyword: str | None = None,
+    ) -> tuple[list[dict], int]:
+        """
+        获取 eMMC 批量检查的目标网关列表。
+        返回 (可检查列表, 被跳过的 M/Z 系列数量)。
+        """
+        base_url = self.config["base_url"]
+        timeout = self.config.get("timeout_page_load", 30000)
+
+        all_gateways = ac_fetch_gateways(self.page, base_url, status="online", timeout=timeout)
+        if not all_gateways:
+            return [], 0
+
+        gw_list = []
+        for gw in all_gateways:
+            info = extract_gateway_info(gw)
+            mac_upper = info.get("mac", "").upper()
+            if mac_upper:
+                self._gateway_models[mac_upper] = info.get("model", "")
+            gw_list.append(info)
+
+        if macs:
+            mac_set = {m.upper() for m in macs}
+            gw_list = [g for g in gw_list if g.get("mac", "").upper() in mac_set]
+
+        if keyword:
+            kw = keyword.lower()
+            gw_list = [
+                g for g in gw_list
+                if kw in g.get("name", "").lower()
+                or kw in g.get("mac", "").lower()
+                or kw in g.get("model", "").lower()
+            ]
+
+        skipped = 0
+        targets = []
+        for g in gw_list:
+            model = g.get("model", "")
+            if model and model[0].upper() in self._SSH_UNSUPPORTED_PREFIXES:
+                skipped += 1
+            else:
+                targets.append(g)
+
+        return targets, skipped
+
+    def _preview_batch_check_emmc(
+        self, macs: list[str] | None = None, keyword: str | None = None,
+    ) -> str:
+        targets, skipped = self._get_emmc_target_gateways(macs, keyword)
+        n = len(targets)
+        est_minutes = max(1, n * 0.5)
+        parts = [f"将检查 {n} 个在线网关的 eMMC 健康状态"]
+        if skipped:
+            parts.append(f"（已排除 {skipped} 个 M/Z 系列）")
+        parts.append(f"，预计耗时约 {est_minutes:.0f} 分钟")
+        return "".join(parts)
+
+    def _tool_batch_check_emmc(
+        self, macs: list[str] | None = None, keyword: str | None = None,
+    ) -> str:
+        targets, skipped = self._get_emmc_target_gateways(macs, keyword)
+        if not targets:
+            return "没有符合条件的在线网关可供检查"
+
+        results = []
+        total = len(targets)
+        base_url = self.config["base_url"]
+
+        for i, gw in enumerate(targets, 1):
+            mac = gw.get("mac", "")
+            entry = {
+                "mac": mac,
+                "name": gw.get("name", ""),
+                "model": gw.get("model", ""),
+                "status": "success",
+                "error": "",
+            }
+            logger.info(f"[eMMC] ({i}/{total}) 开始检查: {mac} ({gw.get('name', '')})")
+
+            try:
+                ssh_result = self._tool_ssh_to_gateway(mac)
+                if ssh_result.startswith("错误"):
+                    entry["status"] = "ssh_failed"
+                    entry["error"] = ssh_result
+                    results.append(entry)
+                    self._ssh_connected = False
+                    logger.warning(f"[eMMC] ({i}/{total}) SSH 连接失败: {mac}")
+                    continue
+
+                devname_output = self._tool_run_gateway_command(self._EMMC_CMD_DEVNAME)
+                extcsd_output = self._tool_run_gateway_command(self._EMMC_CMD_EXTCSD)
+                parsed = self._parse_emmc_output(devname_output, extcsd_output)
+                entry.update(parsed)
+                logger.info(
+                    f"[eMMC] ({i}/{total}) 检查完成: {mac} -> "
+                    f"EST_TYP_A={parsed.get('EST_TYP_A')}, {parsed.get('health_level')}"
+                )
+            except Exception as e:
+                entry["status"] = "error"
+                entry["error"] = str(e)
+                logger.error(f"[eMMC] ({i}/{total}) 检查异常: {mac} -> {e}")
+
+            results.append(entry)
+
+            # 回到网关列表页面，为下一个网关做准备
+            try:
+                self.page.goto(f"{base_url}/ap?view", wait_until="domcontentloaded", timeout=15000)
+                self.page.wait_for_timeout(1000)
+                self._ssh_connected = False
+            except Exception:
+                pass
+
+        report_paths = self._generate_emmc_report(results)
+
+        success = sum(1 for r in results if r["status"] == "success")
+        failed = total - success
+        risk = sum(1 for r in results if r.get("health_value", 0) >= 7 and r["status"] == "success")
+
+        summary_lines = [
+            f"eMMC 批量检查完成: {total} 个网关",
+            f"  成功: {success}, 失败: {failed}",
+        ]
+        if skipped:
+            summary_lines.append(f"  跳过 M/Z 系列: {skipped}")
+        if risk:
+            summary_lines.append(f"  ⚠ 风险网关 (EST_TYP_A >= 7): {risk} 个")
+        summary_lines.append(f"\n报告已生成:")
+        for path in report_paths:
+            summary_lines.append(f"  - {path}")
+
+        return "\n".join(summary_lines)
+
+    def _generate_emmc_report(self, results: list[dict]) -> list[str]:
+        """生成 eMMC 检查报告文件（JSON + CSV + HTML），返回文件路径列表。"""
+        reports_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "reports")
+        os.makedirs(reports_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        paths = []
+
+        # JSON
+        json_path = os.path.join(reports_dir, f"emmc_results_{ts}.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        paths.append(json_path)
+
+        # CSV
+        csv_path = os.path.join(reports_dir, f"emmc_results_{ts}.csv")
+        csv_columns = ["mac", "name", "model", "devName", "EST_TYP_A", "EST_TYP_B", "EOL_INFO", "health_level", "status", "error"]
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_columns, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(results)
+        paths.append(csv_path)
+
+        # HTML
+        html_path = os.path.join(reports_dir, f"emmc_report_{ts}.html")
+        html_content = self._build_emmc_html_report(results)
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        paths.append(html_path)
+
+        logger.info(f"[eMMC] 报告已生成: {paths}")
+        return paths
+
+    def _build_emmc_html_report(self, results: list[dict]) -> str:
+        """生成 eMMC HTML 分析报告。"""
+        import html as html_mod
+
+        _HL = [
+            {"name": "健康", "min": 1, "max": 3, "color": "#22c55e", "bg": "#f0fdf4"},
+            {"name": "良好", "min": 4, "max": 6, "color": "#f59e0b", "bg": "#fefce8"},
+            {"name": "警告", "min": 7, "max": 9, "color": "#f97316", "bg": "#fff7ed"},
+            {"name": "危险", "min": 10, "max": 11, "color": "#ef4444", "bg": "#fef2f2"},
+        ]
+        def _hl_info(val):
+            for lv in _HL:
+                if lv["min"] <= val <= lv["max"]:
+                    return lv
+            return _HL[-1] if val > 0 else {"name": "未知", "color": "#9ca3af", "bg": "#f9fafb"}
+
+        success_data = [r for r in results if r.get("status") == "success"]
+        total = len(results)
+        success_count = len(success_data)
+        failed_count = total - success_count
+
+        level_counts = Counter()
+        vendor_counts = Counter()
+        risk_rows = []
+        for d in success_data:
+            val = d.get("health_value", 0)
+            if val > 0:
+                info = _hl_info(val)
+                level_counts[info["name"]] += 1
+                vendor_counts[d.get("devName", "N/A")] += 1
+            if val >= 7:
+                risk_rows.append(d)
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Overview cards
+        cards_html = f"""
+        <div style="display:flex;gap:16px;margin-bottom:24px;flex-wrap:wrap;">
+            <div style="flex:1;min-width:150px;padding:16px;border-radius:8px;background:#f0fdf4;border:1px solid #bbf7d0;">
+                <div style="font-size:28px;font-weight:700;color:#22c55e;">{success_count}</div>
+                <div style="color:#666;">检查成功</div>
+            </div>
+            <div style="flex:1;min-width:150px;padding:16px;border-radius:8px;background:#fef2f2;border:1px solid #fecaca;">
+                <div style="font-size:28px;font-weight:700;color:#ef4444;">{failed_count}</div>
+                <div style="color:#666;">检查失败</div>
+            </div>
+            <div style="flex:1;min-width:150px;padding:16px;border-radius:8px;background:#fff7ed;border:1px solid #fed7aa;">
+                <div style="font-size:28px;font-weight:700;color:#f97316;">{len(risk_rows)}</div>
+                <div style="color:#666;">风险网关 (≥7)</div>
+            </div>
+        </div>"""
+
+        # Health level distribution
+        level_html_parts = []
+        for lv in _HL:
+            cnt = level_counts.get(lv["name"], 0)
+            level_html_parts.append(
+                f'<span style="display:inline-block;padding:4px 12px;border-radius:4px;'
+                f'background:{lv["bg"]};color:{lv["color"]};margin-right:8px;font-weight:600;">'
+                f'{lv["name"]}: {cnt}</span>'
+            )
+        level_html = "".join(level_html_parts)
+
+        # Risk table
+        risk_table = ""
+        if risk_rows:
+            rows_html = ""
+            for r in sorted(risk_rows, key=lambda x: x.get("health_value", 0), reverse=True):
+                val = r.get("health_value", 0)
+                info = _hl_info(val)
+                rows_html += f"""<tr>
+                    <td>{html_mod.escape(r.get('mac', ''))}</td>
+                    <td>{html_mod.escape(r.get('name', ''))}</td>
+                    <td>{html_mod.escape(r.get('model', ''))}</td>
+                    <td>{html_mod.escape(r.get('devName', ''))}</td>
+                    <td>{html_mod.escape(r.get('EST_TYP_A', ''))}</td>
+                    <td style="color:{info['color']};font-weight:700;">{info['name']}</td>
+                </tr>"""
+            risk_table = f"""
+            <h2 style="color:#f97316;">⚠ 风险网关清单</h2>
+            <table style="width:100%;border-collapse:collapse;margin-bottom:24px;">
+                <thead><tr style="background:#f8fafc;">
+                    <th style="padding:8px;border:1px solid #e2e8f0;text-align:left;">MAC</th>
+                    <th style="padding:8px;border:1px solid #e2e8f0;text-align:left;">名称</th>
+                    <th style="padding:8px;border:1px solid #e2e8f0;text-align:left;">型号</th>
+                    <th style="padding:8px;border:1px solid #e2e8f0;text-align:left;">芯片</th>
+                    <th style="padding:8px;border:1px solid #e2e8f0;text-align:left;">EST_TYP_A</th>
+                    <th style="padding:8px;border:1px solid #e2e8f0;text-align:left;">健康等级</th>
+                </tr></thead>
+                <tbody>{rows_html}</tbody>
+            </table>"""
+
+        # Full results table
+        all_rows_html = ""
+        for r in results:
+            val = r.get("health_value", 0)
+            info = _hl_info(val) if val > 0 else {"color": "#9ca3af", "name": r.get("status", "")}
+            err = html_mod.escape(r.get("error", ""))
+            all_rows_html += f"""<tr>
+                <td>{html_mod.escape(r.get('mac', ''))}</td>
+                <td>{html_mod.escape(r.get('name', ''))}</td>
+                <td>{html_mod.escape(r.get('model', ''))}</td>
+                <td>{html_mod.escape(r.get('devName', 'N/A'))}</td>
+                <td>{html_mod.escape(r.get('EST_TYP_A', 'N/A'))}</td>
+                <td>{html_mod.escape(r.get('EST_TYP_B', 'N/A'))}</td>
+                <td>{html_mod.escape(r.get('EOL_INFO', 'N/A'))}</td>
+                <td style="color:{info['color']};font-weight:600;">{info.get('name', '')}</td>
+                <td style="color:#999;font-size:12px;">{err}</td>
+            </tr>"""
+
+        return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>eMMC 健康检查报告</title>
+<style>
+    body {{ font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:0; padding:24px; background:#fafbfc; color:#1a202c; }}
+    h1 {{ color:#1e293b; border-bottom:2px solid #e2e8f0; padding-bottom:12px; }}
+    h2 {{ color:#334155; margin-top:32px; }}
+    table {{ width:100%; border-collapse:collapse; margin-bottom:24px; }}
+    th {{ padding:10px; border:1px solid #e2e8f0; text-align:left; background:#f8fafc; font-weight:600; }}
+    td {{ padding:8px 10px; border:1px solid #e2e8f0; }}
+    tr:hover {{ background:#f1f5f9; }}
+    .meta {{ color:#64748b; font-size:14px; margin-bottom:24px; }}
+</style>
+</head>
+<body>
+<h1>eMMC 健康检查报告</h1>
+<div class="meta">生成时间: {now} &nbsp;|&nbsp; 共 {total} 个网关</div>
+{cards_html}
+<h2>健康等级分布</h2>
+<div style="margin-bottom:24px;">{level_html}</div>
+{risk_table}
+<h2>全量检查结果</h2>
+<table>
+    <thead><tr style="background:#f8fafc;">
+        <th>MAC</th><th>名称</th><th>型号</th><th>芯片</th>
+        <th>EST_TYP_A</th><th>EST_TYP_B</th><th>EOL_INFO</th>
+        <th>健康等级</th><th>备注</th>
+    </tr></thead>
+    <tbody>{all_rows_html}</tbody>
+</table>
+</body>
+</html>"""
+
     # ---- 领域工具: AC API ----
 
     def _tool_fetch_gateways(self, status: str = "all") -> str:
@@ -615,6 +1072,9 @@ class ToolExecutor:
         for gw in gateways:
             info = extract_gateway_info(gw)
             result.append(info)
+            mac_upper = info.get("mac", "").upper()
+            if mac_upper:
+                self._gateway_models[mac_upper] = info.get("model", "")
 
         return json.dumps(result, ensure_ascii=False, indent=2)
 

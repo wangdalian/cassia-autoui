@@ -18,27 +18,12 @@ import time
 from playwright.sync_api import sync_playwright
 from prompt_toolkit import PromptSession
 from rich.console import Console
+from rich.live import Live
 from rich.markdown import Markdown
-from rich.theme import Theme
 
-# Cassia 品牌色主题
-# Primary: #068466 (teal)  Accent: #FC9F5B (coral)  Dark: #001E42 (navy)
-_cassia_theme = Theme({
-    "markdown.h1": "bold #068466",
-    "markdown.h2": "bold #068466",
-    "markdown.h3": "#068466",
-    "markdown.h4": "#068466",
-    "markdown.strong": "bold #FC9F5B",
-    "markdown.emph": "italic #FC9F5B",
-    "markdown.link": "#068466 underline",
-    "markdown.code": "#FC9F5B",
-    "markdown.item.bullet": "#068466",
-    "markdown.item.number": "#068466",
-    "markdown.hr": "#068466",
-})
+from agent.utils import CASSIA_THEME
 
-# Rich 终端 (用于渲染 LLM 输出的 Markdown)
-_console = Console(theme=_cassia_theme)
+_console = Console(theme=CASSIA_THEME)
 
 # 添加项目根目录到 sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -48,6 +33,7 @@ if PROJECT_ROOT not in sys.path:
 from lib.config import load_config, apply_log_level
 from lib.browser import BrowserManager
 from agent.core import CassiaAgent
+from agent.utils import fix_emoji_spacing as _fix_emoji_spacing
 
 logger = logging.getLogger("cassia")
 
@@ -100,25 +86,50 @@ def cprint(text: str, color: str = "", bold: bool = False):
 
 
 # ============================================================
-# 回调函数
+# 流式 Markdown 渲染
 # ============================================================
+
+_live: Live | None = None
+_md_buffer: str = ""
+_streamed_content = False
+_last_streamed_text: str = ""
+
 
 def on_thinking(text: str):
     """LLM 思考完成回调 (非流式 fallback 时使用) — 渲染完整 Markdown"""
     print()
-    _console.print(Markdown(text))
+    _console.print(Markdown(_fix_emoji_spacing(text)))
 
 
-_streamed_content = False  # 标记本轮是否已有流式输出
+def on_thinking_stream_start():
+    """流式开始 — 启动 Rich Live 实时 Markdown 渲染"""
+    global _live, _md_buffer
+    _md_buffer = ""
+    _live = Live(
+        Markdown(""),
+        console=_console,
+        refresh_per_second=8,
+        vertical_overflow="visible",
+    )
+    _live.start()
 
 
 def on_thinking_chunk(text: str):
-    """LLM 流式思考回调 — 逐字输出到终端 (原始文本，不渲染 Markdown)"""
-    global _streamed_content
+    """流式 chunk — 累积文本并实时更新 Markdown 渲染"""
+    global _md_buffer, _streamed_content
     _streamed_content = True
-    _console.file.flush()  # 先刷新 Rich 的缓冲，防止与 stdout 交错
-    sys.stdout.write(text)
-    sys.stdout.flush()
+    _md_buffer += text
+    if _live:
+        _live.update(Markdown(_fix_emoji_spacing(_md_buffer)))
+
+
+def on_thinking_stream_end(content: str):
+    """流式结束 — 停止 Live 上下文，最终渲染保留在终端"""
+    global _live, _last_streamed_text
+    _last_streamed_text = content
+    if _live:
+        _live.stop()
+        _live = None
 
 
 def on_tool_call(tool_name: str, args: dict, result: str):
@@ -190,15 +201,15 @@ def main():
         config["log_level"] = "DEBUG"
     apply_log_level(config)
 
-    # 打印配置摘要 (Cassia 品牌色)
-    _console.print("=" * 60, style="#068466")
-    _console.print("  Cassia AC AI Agent", style="bold #068466")
-    _console.print("=" * 60, style="#068466")
-    _console.print(f"  AC 地址: {config.get('base_url', '未配置')}", style="dim")
+    # 打印配置摘要
+    _console.print("─" * 56, style="#5C6370")
+    _console.print("  Cassia AC AI Agent", style="bold #82AAFF")
+    _console.print("─" * 56, style="#5C6370")
+    _console.print(f"  AC 地址  {config.get('base_url', '未配置')}", style="dim")
     llm_config = config.get("llm", {})
-    _console.print(f"  LLM: {llm_config.get('model', '未配置')} @ {llm_config.get('base_url', '未配置')}", style="dim")
-    _console.print(f"  最大步数: {config.get('agent', {}).get('max_steps', 30)}", style="dim")
-    _console.print("=" * 60, style="#068466")
+    _console.print(f"  LLM     {llm_config.get('model', '未配置')} @ {llm_config.get('base_url', '未配置')}", style="dim")
+    _console.print(f"  步数上限 {config.get('agent', {}).get('max_steps', 30)}", style="dim")
+    _console.print("─" * 56, style="#5C6370")
     print()
 
     # 启动浏览器
@@ -221,6 +232,8 @@ def main():
             on_thinking=on_thinking,
             on_thinking_chunk=on_thinking_chunk,
             on_tool_call=on_tool_call,
+            on_thinking_stream_start=on_thinking_stream_start,
+            on_thinking_stream_end=on_thinking_stream_end,
         )
 
         # 交互循环
@@ -261,7 +274,7 @@ def main():
 
             # 执行 Agent 任务
             global _streamed_content
-            _streamed_content = False  # 重置流式输出标记
+            _streamed_content = False
 
             cprint(f"\n{'─' * 40}", Colors.DIM)
             start_time = time.time()
@@ -271,14 +284,16 @@ def main():
             except Exception as e:
                 result = f"执行出错: {e}"
                 logger.error(f"Agent 执行异常: {e}", exc_info=True)
+                # 确保异常时也关闭 Live 上下文
+                on_thinking_stream_end("")
 
             elapsed = time.time() - start_time
             cprint(f"{'─' * 40}", Colors.DIM)
             print()
-            # 如果内容已通过流式逐字输出且没有经过 done() 工具，跳过重复渲染
-            # done() 返回的是 summary，与流式输出的 thinking 不同，需要渲染
-            if not _streamed_content or result != agent.last_streamed_content:
-                _console.print(Markdown(result))
+            # 流式内容已通过 Rich Live 实时渲染；
+            # 当结果与流式内容不同时（如 done() 工具返回的摘要），额外渲染
+            if not _streamed_content or result != _last_streamed_text:
+                _console.print(Markdown(_fix_emoji_spacing(result)))
             cprint(f"(耗时 {elapsed:.1f}s)\n", Colors.DIM)
 
         # 清理
