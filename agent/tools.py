@@ -7,6 +7,7 @@ Agent 工具注册表
   2. 领域工具: ssh_to_gateway, run_gateway_command, fetch_gateways, ac_api_call
 """
 
+import base64
 import csv
 import json
 import logging
@@ -331,6 +332,11 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": "查询参数字符串 (如 status=online&pageSize=50)",
                     },
+                    "content_type": {
+                        "type": "string",
+                        "enum": ["json", "form"],
+                        "description": "请求体编码格式。json(默认)=application/json, form=application/x-www-form-urlencoded (用于固件升级等)",
+                    },
                 },
                 "required": ["method", "path"],
             },
@@ -425,6 +431,7 @@ class ToolExecutor:
         self._ws_polling_mode = False
         self._screenshots_dir = "screenshots"
         self._gateway_models: dict[str, str] = {}
+        self._ssh_cred_cache: dict[str, int] = {}
         # 大数据缓存: API 返回大量数据时写入临时文件，供 search_data 工具检索
         self._last_data_file: str | None = None
         self._last_data_count: int = 0
@@ -554,28 +561,56 @@ class ToolExecutor:
         if unsupported:
             return unsupported
 
-        max_attempts = 3
-        retry_delays = [2000, 5000]
+        creds = self.config.get("ssh_credentials", [])
+        if not creds:
+            creds = [{"blue_password": self.config.get("blue_password", ""),
+                       "su_password": self.config.get("su_password", "")}]
 
-        for attempt in range(1, max_attempts + 1):
-            result = self._ssh_connect_once(mac)
-            if not result.startswith("错误:"):
+        mac_upper = mac.upper()
+        cached_idx = self._ssh_cred_cache.get(mac_upper)
+
+        order = list(range(len(creds)))
+        if cached_idx is not None and cached_idx in order:
+            order.remove(cached_idx)
+            order.insert(0, cached_idx)
+
+        last_result = "错误: SSH 连接失败"
+        for idx in order:
+            cred = creds[idx]
+            bp = cred.get("blue_password", "")
+            sp = cred.get("su_password", "")
+
+            result, fail_type = self._ssh_connect_once(mac, blue_password=bp, su_password=sp)
+            if fail_type == "success":
+                self._ssh_cred_cache[mac_upper] = idx
                 return result
-            # 连接失败
-            if attempt < max_attempts:
-                delay = retry_delays[attempt - 1]
-                logger.warning(
-                    f"[SSH] 第 {attempt} 次连接失败，{delay/1000:.0f}s 后重试: {result}"
-                )
-                self.page.wait_for_timeout(delay)
-            else:
-                logger.error(f"[SSH] {max_attempts} 次连接均失败: {result}")
-                return result
 
-        return "错误: SSH 连接失败"
+            if fail_type == "network_fail":
+                logger.warning(f"[SSH] 凭据 #{idx} 网络失败，3s 后同凭据重试: {result}")
+                self.page.wait_for_timeout(3000)
+                result, fail_type = self._ssh_connect_once(mac, blue_password=bp, su_password=sp)
+                if fail_type == "success":
+                    self._ssh_cred_cache[mac_upper] = idx
+                    return result
 
-    def _ssh_connect_once(self, mac: str) -> str:
-        """单次 SSH 连接尝试 (enable → tunnel → terminal → prompt → su)。"""
+            last_result = result
+            logger.warning(f"[SSH] 凭据 #{idx} 失败 ({fail_type}): {result}")
+
+        logger.error(f"[SSH] 所有凭据均失败: {last_result}")
+        return last_result
+
+    def _ssh_connect_once(
+        self, mac: str,
+        blue_password: str | None = None,
+        su_password: str | None = None,
+    ) -> tuple[str, str]:
+        """
+        单次 SSH 连接尝试 (enable -> tunnel -> terminal -> prompt -> su)。
+
+        Returns:
+            (result_text, failure_type) where failure_type is
+            "success", "auth_fail", or "network_fail".
+        """
         base_url = self.config["base_url"]
         timeout = self.config.get("timeout_page_load", 30000)
 
@@ -595,21 +630,42 @@ class ToolExecutor:
 
         # Step 2: 开启隧道
         open_tunnel(self.page, mac, base_url, timeout)
-        self.page.wait_for_timeout(2000)  # 等待隧道完全建立
+        self.page.wait_for_timeout(2000)
 
-        # Step 3: 打开 Web Terminal
-        open_ssh_terminal(
-            self.page, base_url,
-            timeout_page_load=timeout,
-            timeout_terminal_ready=self.config.get("timeout_terminal_ready", 30000),
+        # Step 3: 打开 Web Terminal（需要 blue Basic Auth）
+        # 仅当 blue_password 与 context 默认值不同时，通过 page.route 覆盖 Auth 头
+        need_route = (
+            blue_password is not None
+            and blue_password != self.config.get("blue_password", "")
         )
+        _override_handler = None
+        if need_route:
+            token = base64.b64encode(f"blue:{blue_password}".encode()).decode()
+            def _override_handler(route):
+                headers = {**route.request.headers, "Authorization": f"Basic {token}"}
+                route.continue_(headers=headers)
+            self.page.route("**/ssh/**", _override_handler)
+
+        try:
+            open_ssh_terminal(
+                self.page, base_url,
+                timeout_page_load=timeout,
+                timeout_terminal_ready=self.config.get("timeout_terminal_ready", 30000),
+            )
+        except PermissionError:
+            return ("错误: blue 密码认证失败 (HTTP 401)", "auth_fail")
+        except (TimeoutError, RuntimeError) as e:
+            return (f"错误: SSH 终端打开失败: {e}", "network_fail")
+        finally:
+            if need_route and _override_handler is not None:
+                self.page.unroute("**/ssh/**", _override_handler)
 
         # Step 4: 等待 prompt
         prompt_timeout = self.config.get("timeout_prompt_wait", 30000)
         try:
             wait_for_terminal_text(self.page, self.capture, "$", timeout=prompt_timeout)
         except ConnectionError as e:
-            return f"错误: SSH 终端 WebSocket 断连，无法建立连接: {e}"
+            return (f"错误: SSH 终端 WebSocket 断连，无法建立连接: {e}", "network_fail")
         except TimeoutError:
             type_in_terminal(self.page, "", self.config.get("type_delay", 50))
             self.page.wait_for_timeout(2000)
@@ -623,12 +679,12 @@ class ToolExecutor:
         try:
             wait_for_terminal_text(self.page, self.capture, "assword", timeout=10000)
         except ConnectionError as e:
-            return f"错误: SSH 终端 WebSocket 断连: {e}"
+            return (f"错误: SSH 终端 WebSocket 断连: {e}", "network_fail")
         except TimeoutError:
             pass
 
-        su_password = self.config.get("su_password", "")
-        type_password_in_terminal(self.page, su_password, self.config.get("type_delay", 50))
+        pwd = su_password if su_password is not None else self.config.get("su_password", "")
+        type_password_in_terminal(self.page, pwd, self.config.get("type_delay", 50))
 
         try:
             wait_for_new_terminal_text(
@@ -636,9 +692,12 @@ class ToolExecutor:
                 timeout=self.config.get("timeout_command_wait", 30000),
             )
         except ConnectionError as e:
-            return f"错误: SSH 终端 WebSocket 断连: {e}"
+            return (f"错误: SSH 终端 WebSocket 断连: {e}", "network_fail")
         except TimeoutError:
-            self.page.wait_for_timeout(3000)
+            raw = self.capture.get_raw_text()
+            if "Authentication failure" in raw or "incorrect password" in raw:
+                return ("错误: su 密码认证失败", "auth_fail")
+            return ("错误: 等待 root prompt 超时", "network_fail")
 
         if self.capture and self.capture.ws_disconnected:
             self._ws_polling_mode = True
@@ -647,9 +706,9 @@ class ToolExecutor:
             self._ws_polling_mode = False
 
         self._ssh_connected = True
-        self.snapshot.reset()  # 进入终端页面后重置 snapshot
+        self.snapshot.reset()
 
-        return f"已通过 SSH 连接到网关 {mac} (root 用户)"
+        return (f"已通过 SSH 连接到网关 {mac} (root 用户)", "success")
 
     def _tool_run_gateway_command(self, command: str, timeout_ms: int | None = None) -> str:
         if not self._ssh_connected or self.capture is None:
@@ -800,6 +859,38 @@ class ToolExecutor:
             parts.append(f"（已排除 {skipped} 个 M/Z 系列）")
         parts.append(f"，预计耗时约 {est_minutes:.0f} 分钟")
         return "".join(parts)
+
+    _DANGEROUS_AC_PATHS = {
+        "/ap/install/app": "安装容器应用",
+        "/ap/*/upgrade": "升级网关固件",
+    }
+
+    def _preview_ac_api_call(
+        self, method: str, path: str,
+        body: dict | None = None, query: str | None = None,
+        content_type: str = "json",
+    ) -> str | None:
+        if method.upper() != "POST":
+            return None
+        label = self._DANGEROUS_AC_PATHS.get(path)
+        if label is None:
+            return None
+
+        body = body or {}
+        if path == "/ap/install/app":
+            mac = body.get("mac", "未知")
+            app_id = body.get("id", "未知")
+            return f"即将在网关 {mac} 上{label} ({app_id})"
+        elif path == "/ap/*/upgrade":
+            macs = body.get("macs[]", body.get("macs", []))
+            if isinstance(macs, str):
+                macs = [macs]
+            fw = body.get("firmware", "未知")
+            mac_display = ", ".join(macs[:3])
+            if len(macs) > 3:
+                mac_display += f" 等 {len(macs)} 个"
+            return f"即将{label}: 网关 [{mac_display}], 固件 {fw}"
+        return None
 
     def _tool_batch_check_emmc(
         self, macs: list[str] | None = None, keyword: str | None = None,
@@ -1081,6 +1172,7 @@ class ToolExecutor:
     def _tool_ac_api_call(
         self, method: str, path: str,
         body: dict | None = None, query: str | None = None,
+        content_type: str = "json",
     ) -> str:
         base_url = self.config["base_url"]
         timeout = self.config.get("timeout_page_load", 30000)
@@ -1092,8 +1184,11 @@ class ToolExecutor:
         # 使用 json.dumps 转义 URL，确保 \n \r \t " \ 等均安全
         safe_url = json.dumps(url)[1:-1]  # 去掉首尾引号
 
+        ct = ("application/x-www-form-urlencoded"
+              if content_type == "form"
+              else "application/json")
+
         if method == "GET":
-            # GET 请求用 page.evaluate(fetch(...))，带超时
             result = self.page.evaluate(f"""async () => {{
                 const controller = new AbortController();
                 const timer = setTimeout(() => controller.abort(), {timeout});
@@ -1113,7 +1208,10 @@ class ToolExecutor:
                 return {{ ok: resp.ok, status: resp.status, text: await resp.text() }};
             }}""")
         else:
-            result = page_fetch(self.page, url, method, body, timeout=timeout)
+            result = page_fetch(
+                self.page, url, method, body,
+                timeout=timeout, content_type=ct,
+            )
 
         if result.get("ok"):
             text = result.get("text", "")

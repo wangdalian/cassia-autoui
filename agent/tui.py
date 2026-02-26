@@ -188,6 +188,10 @@ class CassiaApp(App):
         self._status_style: str = "yellow"
         self._spinner_idx: int = 0
         self._spinner_timer = None
+        # 螃蟹动画状态（输入框执行中提示）
+        self._crab_pos: int = 0
+        self._crab_dir: int = 1
+        self._crab_timer = None
         # 确认机制状态
         self._confirm_event: threading.Event | None = None
         self._confirm_result: bool = False
@@ -244,6 +248,39 @@ class CassiaApp(App):
     def _tick_spinner(self) -> None:
         self._spinner_idx = (self._spinner_idx + 1) % len(_SPINNER)
         self._update_header()
+
+    # ---- Crab Animation (input placeholder) ----
+
+    _CRAB_TRACK_LEN = 8
+
+    def _start_crab(self) -> None:
+        self._crab_pos = 0
+        self._crab_dir = 1
+        input_widget = self.query_one("#user-input", Input)
+        input_widget._pause_blink(visible=False)
+        if self._crab_timer is None:
+            self._crab_timer = self.set_interval(0.15, self._tick_crab)
+        self._tick_crab()
+
+    def _stop_crab(self) -> None:
+        if self._crab_timer is not None:
+            self._crab_timer.stop()
+            self._crab_timer = None
+        input_widget = self.query_one("#user-input", Input)
+        input_widget.placeholder = "输入指令… (quit 退出, reset 重置对话)"
+        input_widget._restart_blink()
+
+    def _tick_crab(self) -> None:
+        track = ["· "] * self._CRAB_TRACK_LEN
+        track[self._crab_pos] = "🦀"
+        self.query_one("#user-input", Input).placeholder = (
+            "".join(track) + " 执行中，请稍候…"
+        )
+        self._crab_pos += self._crab_dir
+        if self._crab_pos >= self._CRAB_TRACK_LEN - 1:
+            self._crab_dir = -1
+        elif self._crab_pos <= 0:
+            self._crab_dir = 1
 
     # ---- Lifecycle ----
 
@@ -326,6 +363,20 @@ class CassiaApp(App):
         log = self.query_one("#chat-log", StreamingRichLog)
         self.call_from_thread(log.end_stream)
 
+    @staticmethod
+    def _format_tool_line(prefix: str, text: str) -> Text:
+        """将 tool call 文本格式化为每行带 │ 前缀的引用块。
+
+        首行使用 prefix（如 "│ → " 或 "│ ← "），后续行用等宽的 "│   " 对齐。
+        """
+        pad = "│" + " " * (len(prefix) - 1)
+        lines = text.split("\n")
+        formatted = "\n".join(
+            [f"{prefix}{lines[0]}"]
+            + [f"{pad}{line}" for line in lines[1:]]
+        )
+        return Text(formatted, style="dim italic #6B7B8D")
+
     def _cb_tool_call(self, tool_name: str, args: dict, result: str) -> None:
         logger.debug(f"[TUI] _cb_tool_call: {tool_name}, result_len={len(result)}")
         if tool_name == "done":
@@ -338,7 +389,7 @@ class CassiaApp(App):
             args_str = args_str[:117] + "..."
         self.call_from_thread(
             log.write,
-            Text(f"│ → {tool_name}({args_str})", style="dim italic #6B7B8D"),
+            self._format_tool_line("│ → ", f"{tool_name}({args_str})"),
         )
 
         result_stripped = result.strip()
@@ -354,7 +405,7 @@ class CassiaApp(App):
             result_preview = result
         self.call_from_thread(
             log.write,
-            Text(f"│ ← {result_preview}", style="dim italic #6B7B8D"),
+            self._format_tool_line("│ ← ", result_preview),
         )
 
     # ---- Confirm Mechanism (called from worker thread) ----
@@ -479,7 +530,7 @@ class CassiaApp(App):
         self._busy = True
         self._task_start = time.time()
         log = self.query_one("#chat-log", StreamingRichLog)
-        self.call_from_thread(self._set_status, "执行中...", "yellow")
+        self.call_from_thread(self._start_crab)
         logger.debug(f"[TUI] _run_agent START: {user_input!r}")
 
         try:
@@ -508,6 +559,7 @@ class CassiaApp(App):
             Text(f"({elapsed:.1f}s)", style="dim #5C6370"),
         )
         self._busy = False
+        self.call_from_thread(self._stop_crab)
         self.call_from_thread(self._set_status, "就绪", "green")
         self.call_from_thread(self.query_one("#user-input", Input).focus)
         logger.debug("[TUI] _run_agent END")

@@ -22,16 +22,19 @@ def page_fetch(
     add_csrf: bool = True,
     redirect: str = "follow",
     timeout: int = 30000,
+    content_type: str = "application/json",
 ) -> dict:
     """
     在页面内通过 fetch() 发送请求，自动携带浏览器的所有 cookies。
 
     add_csrf=True 时自动从 localStorage key 't' 读取 CSRF token 并注入 body。
+    content_type: "application/json" 或 "application/x-www-form-urlencoded"
     redirect: "follow" (跟随重定向) / "manual" (不跟随)
     返回 { "ok": bool, "status": int, "text": str, "redirected": bool, "url": str }
     """
     body_js = json.dumps(body) if body is not None else "{}"
     extra_headers_js = json.dumps(extra_headers) if extra_headers else "{}"
+    use_form = content_type == "application/x-www-form-urlencoded"
 
     # 转义 URL 中可能破坏 JS 字符串的字符
     safe_url = url.replace("\\", "\\\\").replace('"', '\\"')
@@ -43,8 +46,27 @@ def page_fetch(
             const csrfToken = localStorage.getItem('t');
             if (csrfToken) bodyObj.csrf = csrfToken;
         }}
+        const useForm = {'true' if use_form else 'false'};
+        let finalBody;
+        let contentType;
+        if (useForm) {{
+            const params = new URLSearchParams();
+            for (const [k, v] of Object.entries(bodyObj)) {{
+                if (Array.isArray(v)) {{
+                    const arrayKey = k.endsWith('[]') ? k : k + '[]';
+                    v.forEach(item => params.append(arrayKey, String(item)));
+                }} else {{
+                    params.append(k, String(v));
+                }}
+            }}
+            finalBody = params.toString();
+            contentType = "application/x-www-form-urlencoded";
+        }} else {{
+            finalBody = JSON.stringify(bodyObj);
+            contentType = "application/json";
+        }}
         const headers = {{
-            "Content-Type": "application/json",
+            "Content-Type": contentType,
             ...{extra_headers_js}
         }};
         const controller = new AbortController();
@@ -54,7 +76,7 @@ def page_fetch(
             resp = await fetch("{safe_url}", {{
                 method: "{method}",
                 headers: headers,
-                body: JSON.stringify(bodyObj),
+                body: finalBody,
                 credentials: "same-origin",
                 redirect: "{redirect}",
                 signal: controller.signal
@@ -127,7 +149,9 @@ def open_ssh_terminal(
     logger.info("打开 SSH Web Terminal...")
     # 始终执行 goto，即使 URL 已是 /ssh/host
     # 断连后 WebSocket 已死，必须重新加载页面建立新连接
-    page.goto(f"{base_url}/ssh/host", timeout=timeout_page_load)
+    response = page.goto(f"{base_url}/ssh/host", timeout=timeout_page_load)
+    if response and response.status == 401:
+        raise PermissionError("SSH Web Terminal 认证失败 (HTTP 401)")
     current_url = page.url
     if "session" in current_url or "login" in current_url:
         raise RuntimeError(

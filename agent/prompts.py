@@ -101,7 +101,7 @@ heading "Dashboard" level=1
 
 ### AC API 工具
 - `fetch_gateways(status)`: 获取网关列表，status 可选 "all"/"online"/"offline"，默认 "all"
-- `ac_api_call(method, path, body, query)`: 调用 AC HTTP API
+- `ac_api_call(method, path, body, query, content_type)`: 调用 AC HTTP API，content_type 可选 "json"(默认) 或 "form"(x-www-form-urlencoded)
 - `search_data(keyword, max_results=50)`: 搜索上次 API 返回的大量缓存数据。当 ac_api_call 返回"数据量较大，已缓存"时使用
 
 ### 本地文件工具
@@ -134,9 +134,21 @@ UI 操作时，优先使用 browser_goto 直接导航到目标页面（路径必
 
 常见任务 -> 推荐工具映射：
 - 查看网关列表/状态 → fetch_gateways() 或 ac_api_call(GET, /ap)
+- 查询单个网关详情 → ac_api_call(GET, /ap/{{mac}})，比获取完整列表更高效
 - 查看事件日志 → ac_api_call(GET, /event)，数据量大时自动缓存，再用 search_data 按关键词筛选
 - 查看/修改设置 → ac_api_call(GET|PUT, /setting)
 - 查看固件列表 → ac_api_call(GET, /firmware)
+- 安装容器应用（仅 XE 系列）:
+  1) ac_api_call(GET, /firmware) 获取 app 列表
+  2) 取 firmware.app[].version 的值作为 id（注意不是 .id 字段）
+  3) ac_api_call(POST, /ap/install/app, body={{mac, id}})
+  4) 轮询 ac_api_call(GET, /ap/{{mac}})，直到 container.app_progress == "100"
+- 升级网关固件:
+  1) ac_api_call(GET, /firmware) 获取 router 列表
+  2) 取 firmware.router[].id (UUID) 作为 firmware 参数
+  3) ac_api_call(POST, /ap/*/upgrade, content_type="form", body={{"macs[]":[...], "firmware":"UUID"}})
+  4) 轮询 ac_api_call(GET, /ap/{{mac}})，直到 update_status 为 "update_ok" 或 "update_fail"
+- 调用网关自身 API → ac_api_call(GET|POST, /api2/{{网关API路径}}, query="mac={{MAC}}")，参考 cassia-spec 中 gateway HTTP API 文档
 - 执行网关命令 → ssh_to_gateway + run_gateway_command（M/Z 系列不支持）
 - eMMC 健康检查（单个）→ ssh_to_gateway + check_emmc_health
 - eMMC 批量检查 → batch_check_emmc（自动处理连接/检查/报告）
@@ -158,6 +170,7 @@ UI 操作时，优先使用 browser_goto 直接导航到目标页面（路径必
 9. **直接导航**: UI 操作时优先用 browser_goto(url) 直接跳转目标页面（参考上方"AC 平台页面路由"），不要点击侧边栏导航图标（图标字体隐藏了文字，快照中显示为 link ""，不可区分）
 10. **先筛选再操作**: 在数据列表页面（网关、设备、事件等），先使用页面的搜索框或筛选下拉框缩小数据范围，再进行查看或操作。避免在完整列表上反复滚动浏览。例如：查看 e9 网关 → 先在搜索框输入 "e9"，筛选后只剩目标网关，再点击查看详情。
 11. **报告生成**: 生成 HTML/Markdown 报告或分析文件时，先通过 API、SSH、UI 等方式收集所需数据，然后用 write_local_file 保存到本地。不要用 run_gateway_command echo 大段内容写文件。
+12. **危险操作确认**: 安装应用、升级固件、批量操作等不可逆操作，执行前必须先向用户确认：目标网关（MAC/名称）、操作内容（具体 app 名称/固件版本）、预期影响（异步操作需说明如何查看进度）。用户指令模糊时（如"安装app"未指定具体 app 或网关），必须先询问，不要自行假设。
 
 ## 推理格式
 
@@ -213,8 +226,14 @@ def _load_ac_api_summary() -> str:
         name = api.get("name", "")
         method = api.get("method", "")
         path = api.get("path", "")
-        desc = api.get("description", "").split("\n")[0]  # 只取第一行
-        lines.append(f"- **{method} {path}** ({name}): {desc}")
+        desc_full = api.get("description", "")
+        desc_first_line = desc_full.split("\n")[0]
+
+        hints = _extract_async_hints(desc_full, api)
+        if hints:
+            lines.append(f"- **{method} {path}** ({name}): {desc_first_line} [{hints}]")
+        else:
+            lines.append(f"- **{method} {path}** ({name}): {desc_first_line}")
 
     # 认证说明
     auth = data.get("authentication", {})
@@ -224,7 +243,75 @@ def _load_ac_api_summary() -> str:
             "注意: 所有 API 请求通过 ac_api_call 自动处理 CSRF token 和 session cookie，无需手动管理认证。",
         ])
 
+    # 网关 API 代理说明
+    proxy = data.get("gateway_api_proxy")
+    if proxy:
+        proxy_lines = _build_proxy_summary(proxy)
+        lines.extend(proxy_lines)
+
     return "\n".join(lines)
+
+
+def _extract_async_hints(desc: str, api: dict) -> str:
+    """从 API description 中提取异步操作和关键约束的简短提示。"""
+    hints = []
+    desc_upper = desc.upper()
+
+    if "ASYNCHRONOUS" in desc_upper:
+        hints.append("ASYNC")
+
+    ct = api.get("content_type", "")
+    if ct == "application/x-www-form-urlencoded":
+        hints.append("form-urlencoded")
+
+    constraints_idx = desc.find("Constraints:")
+    if constraints_idx >= 0:
+        constraint_text = desc[constraints_idx:]
+        if "XE series" in constraint_text or "XE 系列" in constraint_text:
+            hints.append("仅XE系列")
+        if "version" in constraint_text and "NOT" in constraint_text:
+            hints.append("id取自firmware.app[].version")
+        if "firmware.router" in constraint_text:
+            hints.append("firmware取自firmware.router[].id")
+
+    return ", ".join(hints)
+
+
+def _build_proxy_summary(proxy: dict) -> list[str]:
+    """从 gateway_api_proxy 节构建代理使用说明。"""
+    lines = [
+        "",
+        "## 网关 API 代理",
+        "",
+        "AC 可通过 MQTT RRPC 代理调用网关自身的 HTTP API:",
+        "",
+    ]
+
+    url_pattern = proxy.get("url_pattern", "")
+    if url_pattern:
+        lines.append(f"- URL 格式: `{url_pattern}`")
+
+    rules = proxy.get("rules", [])
+    for rule in rules[:3]:
+        lines.append(f"- {rule}")
+
+    examples = proxy.get("examples", [])
+    if examples:
+        lines.append("")
+        lines.append("示例:")
+        for ex in examples[:2]:
+            desc = ex.get("description", "")
+            proxied = ex.get("proxied", "")
+            if desc and proxied:
+                lines.append(f"- {desc}: `{proxied}`")
+
+    gateway_docs = proxy.get("gateway_api_docs", [])
+    if gateway_docs:
+        doc_names = ", ".join(gateway_docs)
+        lines.append("")
+        lines.append(f"参考网关 API 文档: {doc_names}")
+
+    return lines
 
 
 def _load_cli_summary() -> str:

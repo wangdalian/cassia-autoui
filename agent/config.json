@@ -3,9 +3,16 @@
   "browser_mode": "persistent",
   "ac_username": "admin",
   "ac_password": "1q2w#E$R",
-  "blue_password": "YuBC5Lp1kX",
-  "su_password": "$$33bRx2S",
-
+  "ssh_credentials": [
+    {
+      "blue_password": "",
+      "su_password": ""
+    },
+    {
+      "blue_password": "",
+      "su_password": ""
+    }
+  ],
   "timeout_page_load": 30000,
   "timeout_terminal_ready": 30000,
   "timeout_prompt_wait": 30000,
@@ -13,14 +20,12 @@
   "type_delay": 50,
   "devtools": false,
   "log_level": "INFO",
-
   "llm": {
     "api_key": "sk-2EwD3sc0KEP3SO5VPV1MS0jmOTY27eDtFqX7aZPi5GksVQYd",
     "base_url": "https://api.moonshot.cn/v1",
     "model": "kimi-k2.5",
     "temperature": 0.1
   },
-
   "agent": {
     "max_steps": 30,
     "wait_after_action_ms": 1000,
