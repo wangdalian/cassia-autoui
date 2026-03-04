@@ -10,7 +10,10 @@
     "blue_password": "YuBC5Lp1kX",
     "su_password": "$$33bRx2S",
 
-    "auto_fetch_gateways": true,
+    "auto_fetch_gateways": false,
+    "enable_ssh": false,
+    "manual_mode": false,
+    "skip_existing": true,
 
     "gateway_macs": [
         "CC:1B:E0:E4:52:0C",
@@ -25,7 +28,9 @@
     "shell_commands": [
         "show version",
         "cat /sys/block/mmcblk0/device/name",
-        "/sbin/mmc extcsd read /dev/mmcblk0 | grep -E 'Life Time|EOL'"
+        "/sbin/mmc extcsd read /dev/mmcblk0 | grep -E 'Life Time|EOL'",
+        "grep mmcblk0p14 /proc/diskstats",
+        "cat /proc/uptime"
     ],
 
     "command_parsers": [
@@ -41,6 +46,31 @@
                 "EST_TYP_A": "EST_TYP_A\\]:\\s*(0x[0-9a-fA-F]+)",
                 "EST_TYP_B": "EST_TYP_B\\]:\\s*(0x[0-9a-fA-F]+)",
                 "EOL_INFO": "EOL_INFO\\]:\\s*(0x[0-9a-fA-F]+)"
+            }
+        },
+        {
+            "command": "grep mmcblk0p14 /proc/diskstats",
+            "extract_by_split": {
+                "match_line": "mmcblk0p14",
+                "fields": {
+                    "ds_reads": 3,
+                    "ds_reads_merged": 4,
+                    "ds_sectors_read": 5,
+                    "ds_read_time_ms": 6,
+                    "ds_writes": 7,
+                    "ds_writes_merged": 8,
+                    "ds_sectors_written": 9,
+                    "ds_write_time_ms": 10,
+                    "ds_io_in_progress": 11,
+                    "ds_io_time_ms": 12,
+                    "ds_weighted_io_time_ms": 13
+                }
+            }
+        },
+        {
+            "command": "cat /proc/uptime",
+            "extract": {
+                "sys_uptime": "(\\d+\\.\\d+)\\s+\\d+\\.\\d+"
             }
         }
     ],

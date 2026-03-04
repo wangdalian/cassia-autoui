@@ -36,6 +36,7 @@ from lib.ac_api import (
     fetch_gateways as ac_fetch_gateways,
     extract_gateway_info,
 )
+from lib.recorder import ActionRecord, ActionRecorder
 
 logger = logging.getLogger("cassia")
 
@@ -404,6 +405,61 @@ TOOL_DEFINITIONS = [
             },
         },
     },
+    # ---- 测试生成 ----
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_test",
+            "description": "将已记录的操作序列生成为 pytest-playwright 测试文件。系统会自动记录你的每一步操作，在完成测试场景后调用此工具即可生成测试用例。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "test_name": {
+                        "type": "string",
+                        "description": "测试名称 (英文, 如 login_success, add_gateway)",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "测试用例描述，说明测试验证的场景和预期结果",
+                    },
+                },
+                "required": ["test_name", "description"],
+            },
+        },
+    },
+    # ---- 测试执行 ----
+    {
+        "type": "function",
+        "function": {
+            "name": "run_test",
+            "description": "执行指定的 pytest 测试文件。会弹出独立的浏览器窗口直观展示测试过程（headed 模式），用户可观察窗口中的操作。测试在独立进程中运行，不影响当前浏览器。执行完成后返回测试结果。可先用 list_tests 查看可用测试。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "test_path": {
+                        "type": "string",
+                        "description": "测试文件路径 (如 tests/generated/test_login_success.py)",
+                    },
+                    "marker": {
+                        "type": "string",
+                        "description": "pytest marker 过滤 (如 smoke, login)，只运行匹配标记的用例（可选）",
+                    },
+                },
+                "required": ["test_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_tests",
+            "description": "列出所有已生成的测试文件。返回 tests/generated/ 目录下的测试文件列表。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+            },
+        },
+    },
 ]
 
 
@@ -416,17 +472,25 @@ class ToolExecutor:
     工具执行器: 接收 LLM 的 function call，调用实际的 Playwright/lib 函数。
     """
 
+    _NO_RECORD_TOOLS = frozenset(("generate_test", "done", "run_test", "list_tests"))
+
     def __init__(
         self,
         page: Page,
         snapshot: SnapshotParser,
         config: dict,
         capture: TerminalCapture | None = None,
+        recorder: ActionRecorder | None = None,
+        llm_client=None,
+        on_progress=None,
     ):
         self.page = page
         self.snapshot = snapshot
         self.config = config
         self.capture = capture
+        self.recorder = recorder
+        self.llm_client = llm_client
+        self.on_progress = on_progress
         self._ssh_connected = False
         self._ws_polling_mode = False
         self._screenshots_dir = "screenshots"
@@ -439,6 +503,7 @@ class ToolExecutor:
     def execute(self, tool_name: str, arguments: dict) -> str:
         """
         执行指定工具，返回结果字符串。
+        自动将操作基础信息记录到 recorder（snapshot 由 core.py 后续补充）。
 
         Args:
             tool_name: 工具名称
@@ -451,7 +516,24 @@ class ToolExecutor:
             handler = getattr(self, f"_tool_{tool_name}", None)
             if handler is None:
                 return f"错误: 未知工具 '{tool_name}'"
-            return handler(**arguments)
+
+            url_before = self.page.url
+            element_info = self._resolve_element_info(tool_name, arguments)
+
+            result = handler(**arguments)
+
+            # 被动记录: 只记基础信息，snapshot_after 留给 core.py 补充
+            if self.recorder and tool_name not in self._NO_RECORD_TOOLS:
+                self.recorder.record(ActionRecord(
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    element_info=element_info,
+                    url_before=url_before,
+                    url_after=self.page.url,
+                    result=result,
+                ))
+
+            return result
         except Exception as e:
             logger.error(f"[Tool] {tool_name} 执行失败: {e}")
             return f"错误: {e}"
@@ -1188,24 +1270,31 @@ class ToolExecutor:
               if content_type == "form"
               else "application/json")
 
+        if self.on_progress:
+            self.on_progress(
+                f"→ ac_api_call({method} {path}"
+                f"{('?' + query) if query else ''}"
+                f") 超时 {timeout // 1000}s\n"
+            )
+
         if method == "GET":
             result = self.page.evaluate(f"""async () => {{
                 const controller = new AbortController();
                 const timer = setTimeout(() => controller.abort(), {timeout});
-                let resp;
                 try {{
-                    resp = await fetch("{safe_url}", {{
+                    const resp = await fetch("{safe_url}", {{
                         credentials: "same-origin",
                         headers: {{ "X-Requested-With": "XMLHttpRequest" }},
                         signal: controller.signal
                     }});
+                    const text = await resp.text();
+                    clearTimeout(timer);
+                    return {{ ok: resp.ok, status: resp.status, text: text }};
                 }} catch (e) {{
                     clearTimeout(timer);
                     if (e.name === 'AbortError') throw new Error("GET 请求超时 ({timeout}ms): {safe_url}");
                     throw e;
                 }}
-                clearTimeout(timer);
-                return {{ ok: resp.ok, status: resp.status, text: await resp.text() }};
             }}""")
         else:
             result = page_fetch(
@@ -1374,3 +1463,131 @@ class ToolExecutor:
 
     def _tool_done(self, summary: str) -> str:
         return f"__DONE__:{summary}"
+
+    # ---- 测试生成 ----
+
+    def _tool_generate_test(self, test_name: str, description: str) -> str:
+        if not self.recorder:
+            return "错误: 录制器未初始化。"
+
+        records = self.recorder.records
+        if not records:
+            return (
+                "错误: 当前没有操作记录。"
+                "每轮对话开始时操作记录会自动重置，"
+                "请在同一轮对话中先执行测试场景的 UI 操作，然后再调用 generate_test。"
+            )
+
+        trace_text, extra_fixtures = self.recorder.format_trace()
+
+        from lib.test_generator import TestGenerator
+        from lib.test_runner import TestRunner
+
+        llm_config = self.config.get("llm", {})
+        test_config = self.config.get("test", {})
+
+        if not self.llm_client:
+            return "错误: LLM 客户端未初始化。"
+
+        if self.on_progress:
+            self.on_progress(f"正在生成测试用例 [{test_name}]，请稍候...\n\n")
+
+        generator = TestGenerator(self.llm_client, llm_config)
+        runner = TestRunner(test_config.get("output_dir", "tests/generated"))
+        instruction = f"{description} (测试名: {test_name})"
+
+        test_code, test_path, passed = runner.generate_and_verify(
+            generator, trace_text, instruction, test_name,
+            extra_fixtures=extra_fixtures,
+            on_chunk=self.on_progress,
+        )
+
+        if self.on_progress:
+            self.on_progress("\n\n--- 生成完毕 ---\n")
+
+        status = "语法检查通过" if passed else "语法检查未通过 (已保存为 draft，建议手动检查)"
+        output_dir = test_config.get("output_dir", "tests/generated")
+        return (
+            f"测试用例已生成: {test_path}\n"
+            f"状态: {status}\n"
+            f"录制步骤数: {len(records)}\n"
+            f"运行单个: run_test(\"{test_path}\")\n"
+            f"批量回归: pytest {output_dir}/ -v --headed"
+        )
+
+    # ---- 测试执行 ----
+
+    def _tool_run_test(self, test_path: str, marker: str | None = None) -> str:
+        from lib.test_runner import TestRunner
+
+        if not os.path.isfile(test_path):
+            return f"错误: 测试文件不存在: {test_path}"
+
+        test_config = self.config.get("test", {})
+        runner = TestRunner(test_config.get("output_dir", "tests/generated"))
+
+        if self.on_progress:
+            self.on_progress(f"正在执行测试: {test_path} (浏览器窗口即将弹出)\n")
+
+        passed, output = runner.run(
+            test_path,
+            headed=True,
+            slowmo=300,
+            marker=marker,
+        )
+
+        status = "通过 ✓" if passed else "失败 ✗"
+        # 截断过长输出，保留最有价值的部分
+        if len(output) > 5000:
+            output = output[:2000] + "\n...(中间省略)...\n" + output[-2000:]
+
+        return f"测试{status}: {test_path}\n\n{output}"
+
+    def _tool_list_tests(self) -> str:
+        from lib.test_runner import TestRunner
+
+        test_config = self.config.get("test", {})
+        output_dir = test_config.get("output_dir", "tests/generated")
+        runner = TestRunner(output_dir)
+        tests = runner.list_tests()
+
+        if not tests:
+            return f"测试目录 {output_dir}/ 下没有测试文件"
+
+        lines = [f"共 {len(tests)} 个测试文件 ({output_dir}/):", ""]
+        for t in tests:
+            lines.append(f"  - {t['path']}")
+
+        return "\n".join(lines)
+
+    # ---- 内部辅助 ----
+
+    def _resolve_element_info(self, tool_name: str, arguments: dict) -> dict | None:
+        """从 snapshot ref_map 提取元素的语义信息，供录制器使用。"""
+        ref = arguments.get("ref")
+        if ref is None or ref not in self.snapshot._ref_map:
+            return None
+
+        info = dict(self.snapshot._ref_map[ref])
+
+        # 尝试获取父元素信息（从上次快照树中查找）
+        if self.snapshot._last_tree:
+            parent_info = self._find_parent_info(self.snapshot._last_tree, ref)
+            if parent_info:
+                info["parent_role"] = parent_info.get("role", "")
+                info["parent_name"] = parent_info.get("name", "")
+
+        return info
+
+    def _find_parent_info(self, tree: dict, target_ref: int) -> dict | None:
+        """在快照树中查找 target_ref 元素的父节点信息。"""
+        def _search(node: dict, parent: dict | None) -> dict | None:
+            node_ref = node.get("_ref")
+            if node_ref == target_ref:
+                return parent
+            for child in node.get("children", []):
+                result = _search(child, node)
+                if result is not None:
+                    return result
+            return None
+        return _search(tree, None)

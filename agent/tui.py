@@ -10,12 +10,15 @@ Cassia AC AI Agent — Textual TUI 界面
 """
 
 import argparse
+import atexit
 import json
 import logging
 import os
+import signal
 import sys
 import threading
 import time
+import traceback
 
 from rich.markdown import Markdown
 from rich.text import Text
@@ -23,7 +26,9 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.geometry import Size
+from textual.suggester import Suggester
 from textual.widgets import Footer, Input, RichLog, Static
+from textual.worker import get_current_worker
 
 # ============================================================
 # 项目路径与依赖
@@ -41,6 +46,30 @@ from agent.utils import fix_emoji_spacing, CASSIA_THEME
 logger = logging.getLogger("cassia")
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+_DEFAULT_PLACEHOLDER = "输入指令… (/ 查看命令)"
+
+
+# ============================================================
+# SlashCommandSuggester — 输入 / 时补全命令
+# ============================================================
+
+class SlashCommandSuggester(Suggester):
+    """当用户输入 / 开头时，提供斜杠命令补全建议。"""
+
+    def __init__(self, commands: list[str]):
+        super().__init__(use_cache=False, case_sensitive=False)
+        self._commands = sorted(commands)
+
+    async def get_suggestion(self, value: str) -> str | None:
+        if not value.startswith("/"):
+            return None
+        val = value.lower()
+        for cmd in self._commands:
+            if cmd.startswith(val) and cmd != val:
+                return cmd
+        return None
+
 
 # ============================================================
 # StreamingRichLog — 支持流式 Markdown 原地更新
@@ -159,6 +188,16 @@ class CassiaApp(App):
     }
     """
 
+    _SLASH_COMMANDS = {
+        "/stop":     "中断正在运行的任务",
+        "/reset":    "重置对话历史",
+        "/clear":    "清屏",
+        "/snapshot": "显示当前页面快照",
+        "/url":      "显示当前页面 URL",
+        "/help":     "显示所有可用命令",
+        "/quit":     "退出程序",
+    }
+
     BINDINGS = [
         Binding("ctrl+c", "quit", "退出"),
         Binding("ctrl+l", "clear_log", "清屏"),
@@ -196,6 +235,8 @@ class CassiaApp(App):
         self._confirm_event: threading.Event | None = None
         self._confirm_result: bool = False
         self._confirm_mode: bool = False
+        # 工具进度流式状态
+        self._tool_progress_active: bool = False
 
     # ---- Layout ----
 
@@ -212,7 +253,11 @@ class CassiaApp(App):
             wrap=True,
             auto_scroll=True,
         )
-        yield Input(placeholder="输入指令… (quit 退出, reset 重置对话)", id="user-input")
+        yield Input(
+            placeholder=_DEFAULT_PLACEHOLDER,
+            id="user-input",
+            suggester=SlashCommandSuggester(list(self._SLASH_COMMANDS.keys())),
+        )
         yield Footer()
 
     # ---- Header Status ----
@@ -267,7 +312,7 @@ class CassiaApp(App):
             self._crab_timer.stop()
             self._crab_timer = None
         input_widget = self.query_one("#user-input", Input)
-        input_widget.placeholder = "输入指令… (quit 退出, reset 重置对话)"
+        input_widget.placeholder = _DEFAULT_PLACEHOLDER
         input_widget._restart_blink()
 
     def _tick_crab(self) -> None:
@@ -290,6 +335,38 @@ class CassiaApp(App):
         self.query_one("#user-input", Input).focus()
         self._start_browser()
 
+    def _create_agent(self, page) -> CassiaAgent:
+        return CassiaAgent(
+            page=page,
+            config=self._config,
+            on_thinking=self._cb_thinking,
+            on_thinking_chunk=self._cb_thinking_chunk,
+            on_tool_call=self._cb_tool_call,
+            on_thinking_stream_start=self._cb_stream_start,
+            on_thinking_stream_end=self._cb_stream_end,
+            on_reasoning_chunk=self._cb_reasoning_chunk,
+            on_confirm_required=self._cb_confirm_required,
+            on_tool_progress=self._cb_tool_progress,
+        )
+
+    def _recover_browser(self) -> bool:
+        """重建浏览器 + Agent。在 worker 线程中调用。"""
+        self.call_from_thread(self._set_status, "浏览器恢复中...", "yellow")
+        try:
+            if self._browser_mgr:
+                self._browser_mgr.close()
+            self._browser_mgr = BrowserManager(self._config)
+            profile_dir = os.path.join(PROJECT_ROOT, ".browser_profile")
+            self._browser_mgr.launch(self._pw_context, profile_dir)
+            self._agent = self._create_agent(self._browser_mgr.page)
+            logger.info("[TUI] 浏览器已自动恢复")
+            self.call_from_thread(self._set_status, "就绪", "green")
+            return True
+        except Exception as e:
+            logger.error(f"[TUI] 浏览器恢复失败: {e}", exc_info=True)
+            self.call_from_thread(self._set_status, "恢复失败", "red")
+            return False
+
     def _start_browser(self) -> None:
         self._launch_browser_worker()
 
@@ -308,19 +385,7 @@ class CassiaApp(App):
             profile_dir = os.path.join(PROJECT_ROOT, ".browser_profile")
             self._browser_mgr.launch(pw, profile_dir)
 
-            page = self._browser_mgr.page
-
-            self._agent = CassiaAgent(
-                page=page,
-                config=self._config,
-                on_thinking=self._cb_thinking,
-                on_thinking_chunk=self._cb_thinking_chunk,
-                on_tool_call=self._cb_tool_call,
-                on_thinking_stream_start=self._cb_stream_start,
-                on_thinking_stream_end=self._cb_stream_end,
-                on_reasoning_chunk=self._cb_reasoning_chunk,
-                on_confirm_required=self._cb_confirm_required,
-            )
+            self._agent = self._create_agent(self._browser_mgr.page)
 
             self.call_from_thread(self._set_status, "就绪", "green")
         except Exception as e:
@@ -377,8 +442,24 @@ class CassiaApp(App):
         )
         return Text(formatted, style="dim italic #6B7B8D")
 
+    def _cb_tool_progress(self, chunk: str) -> None:
+        """工具内部进度流式回调 — 用于测试生成等耗时工具的实时输出"""
+        log = self.query_one("#chat-log", StreamingRichLog)
+        if not self._tool_progress_active:
+            self._tool_progress_active = True
+            self.call_from_thread(log.begin_stream)
+        self.call_from_thread(log.stream_chunk, chunk)
+
+    def _end_tool_progress(self) -> None:
+        """结束工具进度流式输出（如果活跃）"""
+        if self._tool_progress_active:
+            self._tool_progress_active = False
+            log = self.query_one("#chat-log", StreamingRichLog)
+            self.call_from_thread(log.end_stream)
+
     def _cb_tool_call(self, tool_name: str, args: dict, result: str) -> None:
         logger.debug(f"[TUI] _cb_tool_call: {tool_name}, result_len={len(result)}")
+        self._end_tool_progress()
         if tool_name == "done":
             return
 
@@ -434,16 +515,40 @@ class CassiaApp(App):
         logger.info(f"[TUI] 用户确认结果: {confirmed}")
         return confirmed
 
+    _CONFIRM_PROMPTS = [
+        "⚠ 确认执行？ 输入 y 确认 / n 取消 ⚠",
+        "   确认执行？ 输入 y 确认 / n 取消   ",
+    ]
+
     def _enter_confirm_mode(self) -> None:
-        """切换 Input 到确认模式（主线程调用）。"""
+        """切换 Input 到确认模式：停止螃蟹，启动闪烁提示（主线程调用）。"""
+        if self._crab_timer is not None:
+            self._crab_timer.stop()
+            self._crab_timer = None
+        self._confirm_blink_idx = 0
+        self._confirm_blink_timer = self.set_interval(0.6, self._tick_confirm_blink)
         input_widget = self.query_one("#user-input", Input)
-        input_widget.placeholder = "确认执行？输入 y 确认 / n 取消"
+        input_widget.placeholder = self._CONFIRM_PROMPTS[0]
+        input_widget._restart_blink()
         input_widget.focus()
 
+    def _tick_confirm_blink(self) -> None:
+        """确认模式闪烁 — 交替显示两种提示文本。"""
+        self._confirm_blink_idx = 1 - self._confirm_blink_idx
+        self.query_one("#user-input", Input).placeholder = (
+            self._CONFIRM_PROMPTS[self._confirm_blink_idx]
+        )
+
     def _exit_confirm_mode(self) -> None:
-        """退出确认模式，恢复 Input 状态（主线程调用）。"""
-        input_widget = self.query_one("#user-input", Input)
-        input_widget.placeholder = "输入指令… (quit 退出, reset 重置对话)"
+        """退出确认模式：停止闪烁，恢复螃蟹动画（主线程调用）。"""
+        if hasattr(self, "_confirm_blink_timer") and self._confirm_blink_timer is not None:
+            self._confirm_blink_timer.stop()
+            self._confirm_blink_timer = None
+        if self._busy:
+            self._start_crab()
+        else:
+            input_widget = self.query_one("#user-input", Input)
+            input_widget.placeholder = _DEFAULT_PLACEHOLDER
 
     # ---- Input Handling ----
 
@@ -455,8 +560,14 @@ class CassiaApp(App):
         if not user_input:
             return
 
-        # 确认模式: 拦截 y/n 输入
+        # 确认模式: 拦截 y/n 输入（/stop 可穿透）
         if self._confirm_mode and self._confirm_event is not None:
+            if user_input.strip().lower() == "/stop":
+                self._confirm_result = False
+                self._exit_confirm_mode()
+                self._confirm_event.set()
+                self._handle_stop()
+                return
             answer = user_input.lower()
             log = self.query_one("#chat-log", StreamingRichLog)
             if answer in ("y", "yes"):
@@ -469,43 +580,14 @@ class CassiaApp(App):
             self._confirm_event.set()
             return
 
-        cmd = user_input.lower()
-
-        if cmd in ("quit", "exit", "q"):
-            self._cleanup()
-            self.exit()
+        # 斜杠命令
+        if user_input.startswith("/"):
+            self._handle_slash_command(user_input)
             return
 
-        if cmd == "reset":
-            if self._agent:
-                self._agent.reset()
-            log = self.query_one("#chat-log", StreamingRichLog)
-            log.write(Text("对话已重置", style="yellow"))
-            input_widget.focus()
-            return
-
-        if cmd == "snapshot":
-            if self._agent:
-                text = self._agent.snapshot.get_full_snapshot(self._agent.page)
-                log = self.query_one("#chat-log", StreamingRichLog)
-                log.write(Text(text, style="dim"))
-            input_widget.focus()
-            return
-
-        if cmd == "url":
-            if self._agent:
-                log = self.query_one("#chat-log", StreamingRichLog)
-                log.write(Text(f"当前 URL: {self._agent.page.url}", style="dim"))
-            input_widget.focus()
-            return
-
-        if cmd == "clear":
-            self.query_one("#chat-log", StreamingRichLog).clear()
-            input_widget.focus()
-            return
-
+        # 普通文本 → 发送给 Agent
         if self._busy:
-            self.notify("Agent 正在执行中，请稍候…", severity="warning")
+            self.notify("Agent 正在执行中，请稍候… (输入 /stop 中断)", severity="warning")
             return
 
         if not self._agent:
@@ -523,6 +605,83 @@ class CassiaApp(App):
 
         self._run_agent(user_input)
 
+    # ---- Slash Commands ----
+
+    def _handle_slash_command(self, raw: str) -> None:
+        """分发斜杠命令。"""
+        cmd = raw.strip().lower().split()[0]
+        log = self.query_one("#chat-log", StreamingRichLog)
+        input_widget = self.query_one("#user-input", Input)
+
+        if cmd == "/quit":
+            self._cleanup()
+            self.exit()
+
+        elif cmd == "/stop":
+            self._handle_stop()
+
+        elif cmd == "/reset":
+            if self._agent:
+                self._agent.reset()
+            log.write(Text("对话已重置", style="yellow"))
+            input_widget.focus()
+
+        elif cmd == "/clear":
+            log.clear()
+            input_widget.focus()
+
+        elif cmd == "/snapshot":
+            if self._agent:
+                text = self._agent.snapshot.get_full_snapshot(self._agent.page)
+                log.write(Text(text, style="dim"))
+            else:
+                log.write(Text("浏览器尚未就绪", style="dim red"))
+            input_widget.focus()
+
+        elif cmd == "/url":
+            if self._agent:
+                log.write(Text(f"当前 URL: {self._agent.page.url}", style="dim"))
+            else:
+                log.write(Text("浏览器尚未就绪", style="dim red"))
+            input_widget.focus()
+
+        elif cmd == "/help":
+            self._show_help()
+
+        else:
+            log.write(Text(f"未知命令: {cmd}  (输入 /help 查看可用命令)", style="dim red"))
+            input_widget.focus()
+
+    def _show_help(self) -> None:
+        """显示所有斜杠命令及说明。"""
+        log = self.query_one("#chat-log", StreamingRichLog)
+        log.write(Text(""))
+        log.write(Text("可用命令:", style="bold #C0CAF5"))
+        max_cmd_len = max(len(c) for c in self._SLASH_COMMANDS)
+        for cmd, desc in self._SLASH_COMMANDS.items():
+            log.write(Text(f"  {cmd:<{max_cmd_len}}  {desc}", style="#A9B1D6"))
+        log.write(Text(""))
+        log.write(Text("快捷键: Ctrl+C 退出 | Ctrl+L 清屏 | Ctrl+R 重置 | Ctrl+Y 复制回复", style="dim #6B7B8D"))
+        self.query_one("#user-input", Input).focus()
+
+    def _handle_stop(self) -> None:
+        """中断正在运行的 Agent worker。"""
+        log = self.query_one("#chat-log", StreamingRichLog)
+        if not self._busy:
+            log.write(Text("当前没有正在运行的任务", style="dim #6B7B8D"))
+            self.query_one("#user-input", Input).focus()
+            return
+
+        self.workers.cancel_group(self, "agent")
+        self._tool_progress_active = False
+        log.end_stream()
+        self._busy = False
+        self._stop_crab()
+        self._set_status("已中断", "yellow")
+        log.write(Text(""))
+        log.write(Text("任务已中断", style="bold #E0AF68"))
+        self.query_one("#user-input", Input).focus()
+
     # ---- Agent Worker ----
 
     @work(thread=True, group="agent", exclusive=True)
@@ -534,12 +693,39 @@ class CassiaApp(App):
         logger.debug(f"[TUI] _run_agent START: {user_input!r}")
 
         try:
+            if not self._browser_mgr.is_alive():
+                logger.warning("[TUI] 浏览器已关闭，尝试自动恢复...")
+                if not self._recover_browser():
+                    result = "浏览器已关闭且恢复失败，请重启程序"
+                    self.call_from_thread(log.write, Text(result, style="dim red"))
+                    self._busy = False
+                    self.call_from_thread(self._stop_crab)
+                    self.call_from_thread(self._set_status, "恢复失败", "red")
+                    return
+                self.call_from_thread(
+                    log.write,
+                    Text("浏览器已自动恢复", style="dim #A9B1D6"),
+                )
+
             result = self._agent.run(user_input)
             logger.debug(f"[TUI] _run_agent RESULT: len={len(result)}, preview={result[:100]!r}")
         except Exception as e:
-            result = f"执行出错: {e}"
-            logger.error(f"Agent 执行异常: {e}", exc_info=True)
-            self.call_from_thread(log.end_stream)
+            err_msg = str(e)
+            if "has been closed" in err_msg or "Target closed" in err_msg:
+                logger.warning(f"[TUI] 执行中浏览器关闭: {e}")
+                self.call_from_thread(log.end_stream)
+                if self._recover_browser():
+                    result = "浏览器已自动恢复，请重新输入指令"
+                else:
+                    result = f"浏览器关闭且恢复失败: {e}"
+            else:
+                result = f"执行出错: {e}"
+                logger.error(f"Agent 执行异常: {e}", exc_info=True)
+                self.call_from_thread(log.end_stream)
+
+        if get_current_worker().is_cancelled:
+            logger.debug("[TUI] _run_agent 已被取消，跳过善后")
+            return
 
         elapsed = time.time() - self._task_start
 
@@ -597,6 +783,10 @@ class CassiaApp(App):
     # ---- Cleanup ----
 
     def _cleanup(self) -> None:
+        logger.warning(
+            "[BrowserLifecycle] TUI _cleanup() 被调用, 调用栈:\n%s",
+            "".join(traceback.format_stack()),
+        )
         if self._agent:
             try:
                 self._agent.executor.cleanup()
@@ -609,11 +799,13 @@ class CassiaApp(App):
                 pass
         if self._pw_context:
             try:
+                logger.warning("[BrowserLifecycle] TUI 正在停止 Playwright 上下文 (pw.stop)")
                 self._pw_context.stop()
             except Exception:
                 pass
 
     def on_unmount(self) -> None:
+        logger.warning("[BrowserLifecycle] TUI on_unmount() 触发 (Textual 框架卸载组件)")
         self._cleanup()
 
 
@@ -664,6 +856,23 @@ def main():
     ))
     file_handler.setLevel(logging.DEBUG)
     logging.getLogger("cassia").addHandler(file_handler)
+
+    def _atexit_handler():
+        logger.warning("[BrowserLifecycle] Python 进程正在退出 (atexit)")
+
+    atexit.register(_atexit_handler)
+
+    def _signal_handler(signum, frame):
+        sig_name = signal.Signals(signum).name
+        logger.error(
+            "[BrowserLifecycle] 收到信号 %s, 进程即将退出。调用栈:\n%s",
+            sig_name,
+            "".join(traceback.format_stack(frame)),
+        )
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _signal_handler)
 
     app = CassiaApp(config=config, debug=args.debug)
     app.run()

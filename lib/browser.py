@@ -10,6 +10,7 @@
 import base64
 import logging
 import os
+import traceback
 
 from playwright.sync_api import Page, BrowserContext, Playwright
 
@@ -109,6 +110,7 @@ class BrowserManager:
         self._browser = None
         self._context: BrowserContext | None = None
         self._page: Page | None = None
+        self._closing = False
 
     @property
     def page(self) -> Page:
@@ -144,6 +146,41 @@ class BrowserManager:
 
         # 注册拦截器
         setup_interceptors(self._context, self._page)
+
+        # 注册生命周期诊断事件
+        self._register_lifecycle_listeners()
+
+    def _register_lifecycle_listeners(self):
+        """注册浏览器/页面生命周期事件监听，用于诊断意外退出"""
+        def on_page_close(page):
+            if self._closing:
+                logger.info("[BrowserLifecycle] 页面关闭 (主动关闭)")
+            else:
+                logger.warning(
+                    "[BrowserLifecycle] 页面意外关闭! 调用栈:\n%s",
+                    "".join(traceback.format_stack()),
+                )
+
+        def on_page_crash(page):
+            logger.error("[BrowserLifecycle] 页面崩溃 (crash)! 可能由 OOM 或 GPU 进程异常导致")
+
+        self._page.on("close", on_page_close)
+        self._page.on("crash", on_page_crash)
+        logger.info("[BrowserLifecycle] 已注册 page close/crash 事件监听")
+
+        if self._browser:
+            def on_browser_disconnected(browser):
+                if self._closing:
+                    logger.info("[BrowserLifecycle] 浏览器断开连接 (主动关闭)")
+                else:
+                    logger.error(
+                        "[BrowserLifecycle] 浏览器意外断开连接 (disconnected)! "
+                        "可能原因: Chrome 崩溃 / Playwright 驱动进程退出 / 系统资源不足。调用栈:\n%s",
+                        "".join(traceback.format_stack()),
+                    )
+
+            self._browser.on("disconnected", on_browser_disconnected)
+            logger.info("[BrowserLifecycle] 已注册 browser disconnected 事件监听")
 
     def _launch_persistent(self, pw: Playwright, profile_dir: str | None):
         """persistent 模式: Playwright Chromium + 本地会话持久化"""
@@ -211,8 +248,22 @@ class BrowserManager:
         self._page = self._context.new_page()
         login_ac(self._page, self.config)
 
+    def is_alive(self) -> bool:
+        """检查浏览器页面是否仍然可用（未被用户手动关闭等）"""
+        if self._page is None:
+            return False
+        try:
+            return not self._page.is_closed()
+        except Exception:
+            return False
+
     def close(self):
         """关闭浏览器和上下文"""
+        logger.warning(
+            "[BrowserLifecycle] close() 被调用, 调用栈:\n%s",
+            "".join(traceback.format_stack()),
+        )
+        self._closing = True
         # persistent 模式下 self._browser 为 None，需要单独关闭 context
         if self._context and self._browser is None:
             try:

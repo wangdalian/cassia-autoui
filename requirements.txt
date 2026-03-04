@@ -9,3 +9,10 @@ prompt_toolkit>=3.0
 rich>=13.0
 textual>=0.80
 emoji>=2.0
+
+# 测试框架 (pytest-playwright 回归测试)
+pytest>=8.0
+pytest-playwright>=0.7
+pytest-html>=4.0
+pytest-rerunfailures>=13.0
+pytest-timeout>=2.2

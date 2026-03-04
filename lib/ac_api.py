@@ -35,67 +35,72 @@ def page_fetch(
     body_js = json.dumps(body) if body is not None else "{}"
     extra_headers_js = json.dumps(extra_headers) if extra_headers else "{}"
     use_form = content_type == "application/x-www-form-urlencoded"
+    has_body = method.upper() not in ("GET", "HEAD")
 
     # 转义 URL 中可能破坏 JS 字符串的字符
     safe_url = url.replace("\\", "\\\\").replace('"', '\\"')
 
     result = page.evaluate(f"""async () => {{
-        let bodyObj = {body_js};
+        const hasBody = {'true' if has_body else 'false'};
+        let bodyObj = hasBody ? {body_js} : null;
         const addCsrf = {'true' if add_csrf else 'false'};
-        if (addCsrf) {{
+        if (addCsrf && hasBody) {{
+            if (!bodyObj) bodyObj = {{}};
             const csrfToken = localStorage.getItem('t');
             if (csrfToken) bodyObj.csrf = csrfToken;
         }}
-        const useForm = {'true' if use_form else 'false'};
-        let finalBody;
-        let contentType;
-        if (useForm) {{
-            const params = new URLSearchParams();
-            for (const [k, v] of Object.entries(bodyObj)) {{
-                if (Array.isArray(v)) {{
-                    const arrayKey = k.endsWith('[]') ? k : k + '[]';
-                    v.forEach(item => params.append(arrayKey, String(item)));
-                }} else {{
-                    params.append(k, String(v));
+        let finalBody = null;
+        let contentType = null;
+        if (hasBody && bodyObj !== null) {{
+            const useForm = {'true' if use_form else 'false'};
+            if (useForm) {{
+                const params = new URLSearchParams();
+                for (const [k, v] of Object.entries(bodyObj)) {{
+                    if (Array.isArray(v)) {{
+                        const arrayKey = k.endsWith('[]') ? k : k + '[]';
+                        v.forEach(item => params.append(arrayKey, String(item)));
+                    }} else {{
+                        params.append(k, String(v));
+                    }}
                 }}
+                finalBody = params.toString();
+                contentType = "application/x-www-form-urlencoded";
+            }} else {{
+                finalBody = JSON.stringify(bodyObj);
+                contentType = "application/json";
             }}
-            finalBody = params.toString();
-            contentType = "application/x-www-form-urlencoded";
-        }} else {{
-            finalBody = JSON.stringify(bodyObj);
-            contentType = "application/json";
         }}
         const headers = {{
-            "Content-Type": contentType,
+            ...(contentType ? {{"Content-Type": contentType}} : {{}}),
             ...{extra_headers_js}
         }};
+        const fetchOpts = {{
+            method: "{method}",
+            headers: headers,
+            credentials: "same-origin",
+            redirect: "{redirect}",
+        }};
+        if (finalBody !== null) fetchOpts.body = finalBody;
         const controller = new AbortController();
+        fetchOpts.signal = controller.signal;
         const timer = setTimeout(() => controller.abort(), {timeout});
-        let resp;
         try {{
-            resp = await fetch("{safe_url}", {{
-                method: "{method}",
-                headers: headers,
-                body: finalBody,
-                credentials: "same-origin",
-                redirect: "{redirect}",
-                signal: controller.signal
-            }});
+            const resp = await fetch("{safe_url}", fetchOpts);
+            let text = '';
+            if (resp.type !== 'opaqueredirect') text = await resp.text();
+            clearTimeout(timer);
+            return {{
+                ok: resp.ok,
+                status: resp.status,
+                text: text,
+                redirected: resp.redirected,
+                url: resp.url
+            }};
         }} catch (e) {{
             clearTimeout(timer);
             if (e.name === 'AbortError') throw new Error("fetch 超时 ({timeout}ms): {safe_url}");
             throw e;
         }}
-        clearTimeout(timer);
-        let text = '';
-        if (resp.type !== 'opaqueredirect') text = await resp.text();
-        return {{
-            ok: resp.ok,
-            status: resp.status,
-            text: text,
-            redirected: resp.redirected,
-            url: resp.url
-        }};
     }}""")
 
     # 检测重定向到登录页 (会话过期)

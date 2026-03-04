@@ -478,6 +478,9 @@ AC_PASSWORD = _config.get("ac_password", "1q2w#E$R")
 BLUE_PASSWORD = _config.get("blue_password", "xxx")
 SU_PASSWORD = _config.get("su_password", "xxx")
 AUTO_FETCH_GATEWAYS = _config.get("auto_fetch_gateways", False)
+ENABLE_SSH = _config.get("enable_ssh", False)
+MANUAL_MODE = _config.get("manual_mode", False)
+SKIP_EXISTING = _config.get("skip_existing", True)
 GATEWAY_MACS = _config.get("gateway_macs", [])
 SHELL_COMMANDS = _config.get("shell_commands", [])
 
@@ -601,11 +604,13 @@ def extract_gateway_info(gw: dict) -> dict:
     apps = container.get("apps", [])
     app_version = ""
     if isinstance(apps, list) and apps:
-        app = apps[0]
-        app_version = f"{app.get('name', '')}.{app.get('version', '')}"
+        app_version = "; ".join(
+            f"{a.get('name', '')}.{a.get('version', '')}" for a in apps if isinstance(a, dict)
+        )
 
     return {
         "mac": gw.get("mac", ""),
+        "model": gw.get("model", ""),
         "name": gw.get("name", ""),
         "sn": gw.get("reserved3", ""),
         "status": gw.get("status", ""),
@@ -633,13 +638,18 @@ def page_fetch(page: Page, url: str, method: str = "POST",
     body_js = json.dumps(body) if body is not None else "{}"
     extra_headers_js = json.dumps(extra_headers) if extra_headers else "{}"
 
+    has_body = method.upper() not in ("GET", "HEAD")
+
     result = page.evaluate(f"""async () => {{
-        // 构建请求体
-        let bodyObj = {body_js};
+        const hasBody = {'true' if has_body else 'false'};
+
+        // 构建请求体（GET/HEAD 不允许携带 body）
+        let bodyObj = hasBody ? {body_js} : null;
 
         // 从 localStorage 读取 CSRF token (key='t')，注入 body
         const addCsrf = {'true' if add_csrf else 'false'};
-        if (addCsrf) {{
+        if (addCsrf && hasBody) {{
+            if (!bodyObj) bodyObj = {{}};
             const csrfToken = localStorage.getItem('t');
             if (csrfToken) {{
                 bodyObj.csrf = csrfToken;
@@ -647,23 +657,28 @@ def page_fetch(page: Page, url: str, method: str = "POST",
         }}
 
         const headers = {{
-            "Content-Type": "application/json",
+            ...(hasBody ? {{"Content-Type": "application/json"}} : {{}}),
             ...{extra_headers_js}
         }};
 
+        const fetchOpts = {{
+            method: "{method}",
+            headers: headers,
+            credentials: "same-origin",
+            redirect: "{redirect}",
+            signal: undefined
+        }};
+        if (hasBody && bodyObj !== null) {{
+            fetchOpts.body = JSON.stringify(bodyObj);
+        }}
+
         // 超时控制: 使用 AbortController 避免网络异常时永久挂起
         const controller = new AbortController();
+        fetchOpts.signal = controller.signal;
         const timer = setTimeout(() => controller.abort(), {timeout});
         let resp;
         try {{
-            resp = await fetch("{url}", {{
-                method: "{method}",
-                headers: headers,
-                body: JSON.stringify(bodyObj),
-                credentials: "same-origin",
-                redirect: "{redirect}",
-                signal: controller.signal
-            }});
+            resp = await fetch("{url}", fetchOpts);
         }} catch (e) {{
             clearTimeout(timer);
             if (e.name === 'AbortError') {{
@@ -958,6 +973,16 @@ def _parse_command_output(cmd: str, output_text: str) -> dict:
                 m = re.search(pattern, output_text, re.MULTILINE)
                 if m:
                     result[field_name] = m.group(1)
+            split_cfg = parser.get("extract_by_split")
+            if split_cfg:
+                match_line = split_cfg.get("match_line", "")
+                for line in output_text.splitlines():
+                    if match_line in line:
+                        parts = line.split()
+                        for field_name, idx in split_cfg.get("fields", {}).items():
+                            if idx < len(parts):
+                                result[field_name] = parts[idx]
+                        break
             break
     return result
 
@@ -1102,9 +1127,6 @@ def process_gateway(context: BrowserContext, page: Page, gw_info: dict, index: i
     logger.info(f"[{index}/{total}] 开始处理网关: {display}")
     logger.info(f"{'='*60}")
 
-    # 人工操作模式
-    # page.wait_for_timeout(30000000)
-
     for attempt in range(3):  # 最多尝试 3 次（支持复合故障：如网络异常重试后又遇会话过期）
         try:
             # 每次尝试都重置终端捕获器，避免残留数据导致误匹配
@@ -1114,8 +1136,9 @@ def process_gateway(context: BrowserContext, page: Page, gw_info: dict, index: i
             page.wait_for_timeout(3000)
 
             # Step 1: 启用 SSH
-            enable_ssh(page, mac)
-            page.wait_for_timeout(3000)  # 等待 SSH 服务启动
+            if ENABLE_SSH:
+                enable_ssh(page, mac)
+            page.wait_for_timeout(3000)
 
             # Step 2: 开启 SSH 隧道（页面会自动跳转到 /ssh/host）
             open_tunnel(page, mac)
@@ -1314,21 +1337,28 @@ def main():
         _terminal_capture.attach(page)
         logger.info("终端数据捕获器已初始化（WebSocket 拦截模式）")
 
-        # 获取网关列表
+        # 获取 AP 列表（始终执行，用于元数据查找和 ap_list.json 保存）
+        raw_gateways = fetch_online_gateways(page)
+        ap_lookup = {}
+        if raw_gateways:
+            ap_list_dir = os.path.join(SCRIPT_DIR, "emmc_results")
+            os.makedirs(ap_list_dir, exist_ok=True)
+            ap_list_path = os.path.join(ap_list_dir, "ap_list.json")
+            with open(ap_list_path, "w", encoding="utf-8") as f:
+                json.dump(raw_gateways, f, ensure_ascii=False, indent=2)
+            logger.info(f"AP 列表已保存: {ap_list_path}（{len(raw_gateways)} 条）")
+            ap_lookup = {gw.get("mac", ""): gw for gw in raw_gateways}
+
+        if MANUAL_MODE:
+            logger.info("人工操作模式已启用，AP 列表已获取并保存，脚本暂停...")
+            logger.info("请在浏览器中手动操作，完成后请关闭 manual_mode 并重启脚本")
+            page.wait_for_timeout(30000000)
+
+        # 确定处理哪些网关
         if AUTO_FETCH_GATEWAYS:
-            raw_gateways = fetch_online_gateways(page)
-            # 保存完整的 AP 列表到 emmc_results/（含所有详细信息）
-            if raw_gateways:
-                ap_list_dir = os.path.join(SCRIPT_DIR, "emmc_results")
-                os.makedirs(ap_list_dir, exist_ok=True)
-                ap_list_path = os.path.join(ap_list_dir, "ap_list.json")
-                with open(ap_list_path, "w", encoding="utf-8") as f:
-                    json.dump(raw_gateways, f, ensure_ascii=False, indent=2)
-                logger.info(f"AP 列表已保存: {ap_list_path}（{len(raw_gateways)} 条）")
-            # 只处理 container.status == "running" 的网关
             running_gateways = [
                 gw for gw in raw_gateways
-                if (gw.get("container") or {}).get("status") == "running"
+                if (gw.get("container") or {}).get("status") == "running" and gw.get("reserved0") == "mqtt"
             ]
             skipped = len(raw_gateways) - len(running_gateways)
             if skipped:
@@ -1341,7 +1371,13 @@ def main():
                 logger.error("未获取到符合条件的在线网关（需 container.status=running），退出")
                 sys.exit(1)
         else:
-            gateways = [{"mac": mac} for mac in GATEWAY_MACS]
+            gateways = []
+            for mac in GATEWAY_MACS:
+                if mac in ap_lookup:
+                    gateways.append(extract_gateway_info(ap_lookup[mac]))
+                else:
+                    gateways.append({"mac": mac})
+                    logger.warning(f"  {mac} 未在 AP 列表中找到，仅使用 MAC")
             logger.info(f"使用配置文件中的 {len(gateways)} 个网关")
 
         total = len(gateways)
@@ -1352,6 +1388,15 @@ def main():
         failed_gateways = []  # 收集失败网关信息
 
         for i, gw_info in enumerate(gateways, 1):
+            mac = gw_info["mac"]
+            if SKIP_EXISTING:
+                safe_mac = mac.replace(":", "-")
+                result_path = os.path.join(SCRIPT_DIR, "emmc_results", "gateways", f"{safe_mac}.json")
+                if os.path.isfile(result_path):
+                    logger.info(f"[{i}/{total}] {mac} 结果已存在，跳过")
+                    success_count += 1
+                    continue
+
             result = process_gateway(context, page, gw_info, i, total)
             if result is True:
                 success_count += 1

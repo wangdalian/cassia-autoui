@@ -400,6 +400,7 @@ class SnapshotParser:
                 "value": value,
                 "nth": nth,
             }
+            node["_ref"] = self._counter
 
         parts.append(role)
 

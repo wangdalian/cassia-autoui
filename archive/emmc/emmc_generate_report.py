@@ -55,13 +55,27 @@ def generate():
     total = len(data)
     online_count = sum(1 for d in data if d.get("status") == "online")
 
-    # ── 基础统计 ──────────────────────────────────────────
-    dev_names = sorted(set(d.get("devName", "N/A") for d in data))
+    # ── 数据分类：失败 vs 有效 ────────────────────────────
+    failed_devices = []
+    valid_data = []
+    for d in data:
+        a = parse_hex(d.get("EST_TYP_A", ""))
+        b = parse_hex(d.get("EST_TYP_B", ""))
+        if a <= 0 and b <= 0:
+            failed_devices.append(d)
+        else:
+            valid_data.append(d)
+
+    failed_count = len(failed_devices)
+    valid_count = len(valid_data)
+
+    # ── 基础统计（仅基于有效数据）──────────────────────────
+    dev_names = sorted(set(d.get("devName", "N/A") for d in valid_data)) if valid_data else []
     vendor_count = len(dev_names)
 
-    # EST_TYP_A 整体分布
+    # EST_TYP_A 整体分布（仅有效数据）
     typ_a_counter = Counter()
-    for d in data:
+    for d in valid_data:
         v = parse_hex(d.get("EST_TYP_A", "0x00"))
         if v > 0:
             typ_a_counter[v] += 1
@@ -74,12 +88,12 @@ def generate():
         lv = health_level(val)
         level_counts[lv["name"]] += cnt
 
-    # ── 按厂家分析 ────────────────────────────────────────
-    vendor_typ_a = defaultdict(Counter)  # vendor -> {val: count}
+    # ── 按厂家分析（仅有效数据）──────────────────────────
+    vendor_typ_a = defaultdict(Counter)
     vendor_total = Counter()
     vendor_sum = defaultdict(int)
 
-    for d in data:
+    for d in valid_data:
         dev = d.get("devName", "N/A")
         v = parse_hex(d.get("EST_TYP_A", "0x00"))
         if v > 0:
@@ -97,9 +111,9 @@ def generate():
             lv = health_level(val)
             vendor_level_counts[dev][lv["name"]] += cnt
 
-    # ── 风险网关（EST_TYP_A >= 7）──────────────────────────
+    # ── 风险网关（EST_TYP_A >= 7，仅有效数据）──────────────
     risk_devices = []
-    for d in data:
+    for d in valid_data:
         v = parse_hex(d.get("EST_TYP_A", "0x00"))
         if v >= 7:
             risk_devices.append({**d, "_typ_a_dec": v})
@@ -107,20 +121,19 @@ def generate():
 
     # ── JSON 数据序列化 ──────────────────────────────────
     data_json = json.dumps(data, ensure_ascii=False)
+    risk_json = json.dumps(risk_devices, ensure_ascii=False)
+    failed_json = json.dumps(failed_devices, ensure_ascii=False)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # ── 图表数据准备 ─────────────────────────────────────
-    # 整体分布
     dist_labels = [f"0x{v:02x}" for v in all_typ_a_vals]
     dist_values = [typ_a_counter[v] for v in all_typ_a_vals]
     dist_colors = [bar_color(v) for v in all_typ_a_vals]
 
-    # 分组柱状图 — 厂家 x EST_TYP_A
     vendor_colors = ["#3b82f6", "#8b5cf6", "#ec4899"]
     vendor_borders = ["#2563eb", "#7c3aed", "#db2777"]
     grouped_datasets_js = ""
     for i, dev in enumerate(dev_names):
-        # 无数据的值用 None(→JS null)，让 Chart.js 跳过空柱
         vals = [vendor_typ_a[dev].get(v, None) for v in all_typ_a_vals]
         vals_json = json.dumps(vals)
         grouped_datasets_js += f"""{{
@@ -133,17 +146,14 @@ def generate():
             skipNull: true,
         }},\n"""
 
-    # 厂家占比饼图
     pie_labels = json.dumps(dev_names)
     pie_values = json.dumps([vendor_total[d] for d in dev_names])
     pie_colors = json.dumps(vendor_colors[:len(dev_names)])
 
-    # 厂家平均 EST_TYP_A 横向柱状图
     avg_labels = json.dumps(dev_names)
     avg_values = json.dumps([round(vendor_avg[d], 2) for d in dev_names])
     avg_colors = json.dumps([bar_color(round(vendor_avg[d])) for d in dev_names])
 
-    # 厂家健康等级堆叠
     stacked_datasets_js = ""
     for lv in HEALTH_LEVELS:
         vals = [vendor_level_counts[dev][lv["name"]] for dev in dev_names]
@@ -153,40 +163,12 @@ def generate():
             backgroundColor: '{lv["color"]}',
         }},\n"""
 
-    # ── 风险网关表格行 ───────────────────────────────────
-    badge_cls_map = {
-        "#22c55e": "health-badge-good",
-        "#f59e0b": "health-badge-warn",
-        "#f97316": "health-badge-alert",
-        "#ef4444": "health-badge-bad",
-    }
-    esc = html_mod.escape
-    risk_rows = ""
-    for idx, d in enumerate(risk_devices, 1):
-        lv = health_level(d["_typ_a_dec"])
-        bcls = badge_cls_map.get(lv["color"], "health-badge-bad")
-        mac = d.get('mac', '')
-        mac_file = mac.replace(':', '-')
-        mac_link = f'<span class="mac-link" onclick="showScreenshot(\'{esc(mac_file)}\',\'{esc(mac)}\',this)">{esc(mac)}</span>' if mac else ''
-        risk_rows += f"""<tr>
-            <td>{idx}</td>
-            <td>{mac_link}</td>
-            <td>{esc(d.get('name',''))}</td>
-            <td>{esc(d.get('devName',''))}</td>
-            <td><span class="badge {bcls}">{esc(d.get('EST_TYP_A',''))} ({d['_typ_a_dec']})</span></td>
-            <td>{esc(d.get('EST_TYP_B',''))}</td>
-            <td>{esc(d.get('EOL_INFO',''))}</td>
-            <td>{esc(d.get('appVersion',''))}</td>
-            <td>{esc(d.get('version',''))}</td>
-            <td>{esc(d.get('status',''))}</td>
-        </tr>\n"""
-
     # ── 概览卡片 ─────────────────────────────────────────
     level_i18n_keys = ["lvHealthy", "lvGood", "lvWarning", "lvDanger"]
     cards_html = ""
     for i, lv in enumerate(HEALTH_LEVELS):
         cnt = level_counts[lv["name"]]
-        pct = round(cnt / total * 100, 1) if total else 0
+        pct = round(cnt / valid_count * 100, 1) if valid_count else 0
         cards_html += f"""
         <div class="health-card" style="--accent:{lv['color']}">
             <div class="hc-label" data-i18n="{level_i18n_keys[i]}">{lv['name']}</div>
@@ -196,9 +178,10 @@ def generate():
 
     # ── 图标 & Favicon ───────────────────────────────────
     icon_svg = """<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: text-bottom; margin-right: 8px; color: #3b82f6;"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect><rect x="9" y="9" width="6" height="6"></rect><line x1="9" y1="1" x2="9" y2="4"></line><line x1="15" y1="1" x2="15" y2="4"></line><line x1="9" y1="20" x2="9" y2="23"></line><line x1="15" y1="20" x2="15" y2="23"></line><line x1="20" y1="9" x2="23" y2="9"></line><line x1="20" y1="14" x2="23" y2="14"></line><line x1="1" y1="9" x2="4" y2="9"></line><line x1="1" y1="14" x2="4" y2="14"></line></svg>"""
-    # Favicon: Remove style, set color
     favicon_svg_content = icon_svg.replace('currentColor', '#3b82f6').replace('style="vertical-align: text-bottom; margin-right: 8px; color: #3b82f6;"', '')
     favicon_href = "data:image/svg+xml," + urllib.parse.quote(favicon_svg_content)
+
+    esc = html_mod.escape
 
     # ── HTML 模板 ─────────────────────────────────────────
     html = f"""<!DOCTYPE html>
@@ -210,7 +193,6 @@ def generate():
 <title>eMMC 健康状态分析报告</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <style>
-/* ── CSS 变量: 深色主题 (默认) ────────────────────────── */
 :root {{
   --bg:#0f172a; --text:#e2e8f0; --text-muted:#94a3b8; --text-dim:#475569;
   --card-bg:rgba(255,255,255,0.04); --border:rgba(255,255,255,0.08);
@@ -222,7 +204,6 @@ def generate():
   --chart-text:#94a3b8; --chart-grid:rgba(255,255,255,0.06);
   --link-color:#60a5fa;
 }}
-/* ── CSS 变量: 浅色主题 ──────────────────────────────── */
 :root.light {{
   --bg:#f8fafc; --text:#1e293b; --text-muted:#64748b; --text-dim:#94a3b8;
   --card-bg:rgba(0,0,0,0.03); --border:rgba(0,0,0,0.08);
@@ -233,8 +214,6 @@ def generate():
   --chart-text:#64748b; --chart-grid:rgba(0,0,0,0.08);
   --link-color:#2563eb;
 }}
-
-/* ── 全局重置 & 基础 ─────────────────────────────────── */
 * {{ margin:0; padding:0; box-sizing:border-box; }}
 ::-webkit-scrollbar {{ width:6px; height:6px; }}
 ::-webkit-scrollbar-track {{ background:transparent; }}
@@ -246,8 +225,6 @@ def generate():
 :root.light * {{ scrollbar-color:rgba(0,0,0,0.15) transparent; }}
 body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:var(--bg); color:var(--text); line-height:1.6; transition:background 0.3s,color 0.3s; }}
 .container {{ max-width:1280px; margin:0 auto; padding:24px; }}
-
-/* ── 顶部栏 ──────────────────────────────────────────── */
 .top-bar {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:16px; }}
 .top-bar h1 {{ font-size:15px; font-weight:700; white-space:nowrap; }}
 .tb-right {{ display:flex; align-items:center; gap:8px; }}
@@ -272,13 +249,9 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
   border:1px solid var(--border); border-radius:8px;
 }}
 .report-meta b {{ color:var(--text); font-weight:600; }}
-
-/* ── section 标题 ────────────────────────────────────── */
 .section-title {{
   font-size:14px; font-weight:700; margin:0; padding:20px 0 10px 0; color:var(--text-muted);
 }}
-
-/* ── 概览卡片 ────────────────────────────────────────── */
 .ov-cards {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; margin-bottom:24px; }}
 .ov-card {{
   background:var(--card-bg); border-radius:12px; padding:16px; text-align:center;
@@ -287,8 +260,6 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
 .ov-card .ov-label {{ font-size:11px; color:var(--text-muted); margin-bottom:4px; }}
 .ov-card .ov-value {{ font-size:24px; font-weight:700; }}
 .ov-card .ov-sub {{ font-size:11px; color:var(--text-dim); }}
-
-/* ── 健康等级卡片 ────────────────────────────────────── */
 .health-cards {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin-bottom:24px; }}
 .health-card {{
   background:var(--card-bg); border-radius:12px; padding:16px;
@@ -297,8 +268,6 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
 .health-card .hc-label {{ font-size:11px; color:var(--text-muted); font-weight:500; }}
 .health-card .hc-value {{ font-size:28px; font-weight:700; margin:4px 0; }}
 .health-card .hc-sub {{ font-size:11px; color:var(--text-dim); }}
-
-/* ── 图表区域 ────────────────────────────────────────── */
 .charts-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:20px; }}
 .chart-box {{
   background:var(--card-bg); border-radius:12px; padding:16px;
@@ -309,8 +278,6 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
 .chart-box canvas {{ max-height:280px; }}
 .mac-link {{ color:var(--link-color); text-decoration:underline; cursor:pointer; }}
 .mac-link:hover {{ opacity:0.8; }}
-
-/* ── 截图浮窗 ────────────────────────────────────────── */
 .img-overlay {{ display:none; position:fixed; inset:0; background:rgba(0,0,0,0.35); z-index:9998; }}
 .img-overlay.show {{ display:block; }}
 .img-modal {{
@@ -348,8 +315,6 @@ body {{ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-seri
 .img-modal-actions button:hover {{ background:var(--btn-hover); border-color:#3b82f6; }}
 tr.row-highlight {{ background:rgba(59,130,246,0.18) !important; }}
 :root.light tr.row-highlight {{ background:rgba(59,130,246,0.12) !important; }}
-
-/* ── 表格 ────────────────────────────────────────────── */
 .table-wrap {{
   background:var(--card-bg); border-radius:12px; padding:16px;
   border:1px solid var(--border); overflow-x:auto; margin-bottom:20px;
@@ -362,14 +327,31 @@ th {{
 }}
 th:hover {{ color:var(--text); }}
 th .sort-arrow {{ font-size:10px; margin-left:2px; opacity:0.6; }}
+.th-tip {{
+  display:inline-flex; align-items:center; justify-content:center;
+  width:14px; height:14px; border-radius:50%; margin-left:3px; vertical-align:middle;
+  font-size:10px; font-weight:700; font-style:normal; font-family:serif;
+  color:var(--text-dim); border:1.5px solid var(--text-dim);
+  cursor:help; position:relative;
+}}
+.th-tip:hover {{ color:#3b82f6; border-color:#3b82f6; }}
+.th-tip:hover::after {{
+  content:attr(data-tip);
+  position:absolute; left:50%; top:calc(100% + 6px); transform:translateX(-50%);
+  background:rgba(15,23,42,0.95); color:#e2e8f0; font-size:11px; font-weight:400;
+  padding:8px 12px; border-radius:8px; white-space:pre-line; line-height:1.6;
+  min-width:260px; max-width:360px; z-index:100; pointer-events:none;
+  box-shadow:0 4px 16px rgba(0,0,0,0.3); border:1px solid rgba(255,255,255,0.1);
+}}
+:root.light .th-tip:hover::after {{
+  background:rgba(30,41,59,0.95); color:#f1f5f9;
+}}
 td {{
   padding:6px 10px; border-bottom:1px solid var(--border);
   font-family:"SF Mono","Fira Code",monospace; font-size:11px; white-space:nowrap;
 }}
 tr:hover td {{ background:var(--table-hover); }}
 .mono {{ font-family:"SF Mono","Fira Code",monospace; font-size:11px; }}
-
-/* ── badge ───────────────────────────────────────────── */
 .badge {{
   display:inline-block; padding:2px 8px; border-radius:10px;
   font-size:10px; font-weight:700; color:#fff;
@@ -378,8 +360,6 @@ tr:hover td {{ background:var(--table-hover); }}
 .health-badge-warn {{ background:#f59e0b; }}
 .health-badge-alert {{ background:#f97316; }}
 .health-badge-bad {{ background:#ef4444; }}
-
-/* ── 搜索框 ──────────────────────────────────────────── */
 .search-bar {{ margin-bottom:12px; }}
 .search-bar input {{
   width:100%; max-width:400px; padding:5px 12px; border-radius:16px;
@@ -388,8 +368,6 @@ tr:hover td {{ background:var(--table-hover); }}
 }}
 .search-bar input::placeholder {{ color:var(--text-dim); }}
 .search-bar input:focus {{ border-color:#3b82f6; }}
-
-/* ── 响应式 ──────────────────────────────────────────── */
 @media (max-width:700px) {{
   .charts-grid {{ grid-template-columns:1fr; }}
   .health-cards {{ grid-template-columns:repeat(2,1fr); }}
@@ -431,6 +409,7 @@ tr:hover td {{ background:var(--table-hover); }}
   <div class="ov-card"><div class="ov-label" data-i18n="cardOnline">在线网关</div><div class="ov-value" style="color:#22c55e">{online_count}</div></div>
   <div class="ov-card"><div class="ov-label" data-i18n="cardVendors">eMMC 厂家</div><div class="ov-value" style="color:#8b5cf6">{vendor_count}</div></div>
   <div class="ov-card"><div class="ov-label" data-i18n="cardRisk">风险网关 (&ge;0x07)</div><div class="ov-value" style="color:#ef4444">{len(risk_devices)}</div></div>
+  <div class="ov-card"><div class="ov-label" data-i18n="cardFailed">检测失败</div><div class="ov-value" style="color:#94a3b8">{failed_count}</div></div>
 </div>
 
 <!-- 健康等级概览 -->
@@ -472,38 +451,96 @@ tr:hover td {{ background:var(--table-hover); }}
 <!-- 风险网关清单 -->
 <div class="section-title"><span data-i18n="secRisk">风险网关清单</span> <span style="font-size:11px;color:#ef4444;font-weight:400;">(EST_TYP_A &ge; 0x07, <span data-i18n="riskCount">共 {len(risk_devices)} 台</span>)</span></div>
 <div class="table-wrap">
+<div class="search-bar"><input type="text" id="riskSearchInput" data-i18n-placeholder="searchRiskPlaceholder" placeholder="搜索风险网关..." oninput="riskTM.filter()"></div>
+<div style="max-height:600px;overflow-y:auto;">
 <table id="riskTable">
 <thead><tr>
-  <th>NO</th><th>MAC</th><th data-i18n="thName">网关名称</th><th data-i18n="thVendor">厂家</th><th>EST_TYP_A</th><th>EST_TYP_B</th><th data-i18n="thEol">EOL_INFO</th><th data-i18n="thApp">应用版本</th><th data-i18n="thVersion">版本</th><th data-i18n="thStatus">状态</th>
+  <th>NO</th>
+  <th onclick="riskTM.sort(0)">MAC <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(1)"><span data-i18n="thModel">型号</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(2)"><span data-i18n="thName">网关名称</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(3)"><span data-i18n="thVendor">厂家</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(4)">EST_TYP_A <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(5)">EST_TYP_B <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(6)"><span data-i18n="thEol">EOL_INFO</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(7)"><span data-i18n="thApp">应用版本</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(8)"><span data-i18n="thVersion">版本</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(9)"><span data-i18n="thStatus">状态</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(10)"><span data-i18n="thSysUptime">系统运行时长(s)</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(11)"><span data-i18n="thSysUptimeStr">运行时长</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(12)"><span data-i18n="thSectorsRead">读扇区数</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(13)"><span data-i18n="thSectorsWritten">写扇区数</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(14)"><span data-i18n="thBytesRead">读字节数</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(15)"><span data-i18n="thBytesReadStr">读取量</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(16)"><span data-i18n="thBytesWritten">写字节数</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(17)"><span data-i18n="thBytesWrittenStr">写入量</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(18)"><span data-i18n="thAvgReadRate">平均读速率(B/s)</span><span class="th-tip" data-tip="数据来源: cat /proc/diskstats (mmcblk0p14)&#10;计算公式: SectorsRead × 512 ÷ Sys_Uptime&#10;单位: B/s&#10;含义: 自启动以来的累计平均读取速率" data-i18n-tip="tipAvgReadRate">?</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(19)"><span data-i18n="thAvgReadRateStr">平均读速率</span><span class="th-tip" data-tip="数据来源: cat /proc/diskstats (mmcblk0p14)&#10;计算公式: SectorsRead × 512 ÷ Sys_Uptime&#10;含义: 自启动以来的累计平均读取速率&#10;可读格式自动换算 KB/s, MB/s" data-i18n-tip="tipAvgReadRateStr">?</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(20)"><span data-i18n="thAvgWriteRate">平均写速率(B/s)</span><span class="th-tip" data-tip="数据来源: cat /proc/diskstats (mmcblk0p14)&#10;计算公式: SectorsWritten × 512 ÷ Sys_Uptime&#10;单位: B/s&#10;含义: 自启动以来的累计平均写入速率" data-i18n-tip="tipAvgWriteRate">?</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="riskTM.sort(21)"><span data-i18n="thAvgWriteRateStr">平均写速率</span><span class="th-tip" data-tip="数据来源: cat /proc/diskstats (mmcblk0p14)&#10;计算公式: SectorsWritten × 512 ÷ Sys_Uptime&#10;含义: 自启动以来的累计平均写入速率&#10;可读格式自动换算 KB/s, MB/s" data-i18n-tip="tipAvgWriteRateStr">?</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
 </tr></thead>
-<tbody>
-{risk_rows if risk_rows else '<tr><td colspan="10" style="text-align:center;color:var(--text-dim);padding:24px;"><span data-i18n="noRisk">无风险网关</span></td></tr>'}
-</tbody>
+<tbody id="riskBody"></tbody>
 </table>
+</div>
+</div>
+
+<!-- 失败网关详情 -->
+<div class="section-title"><span data-i18n="secFailed">失败网关详情</span> <span style="font-size:11px;color:#94a3b8;font-weight:400;">(<span data-i18n="failedCount">共 {failed_count} 台</span>)</span></div>
+<div class="table-wrap">
+<div class="search-bar"><input type="text" id="failedSearchInput" data-i18n-placeholder="searchFailedPlaceholder" placeholder="搜索失败网关..." oninput="failedTM.filter()"></div>
+<div style="max-height:600px;overflow-y:auto;">
+<table id="failedTable">
+<thead><tr>
+  <th>NO</th>
+  <th onclick="failedTM.sort(0)">MAC <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="failedTM.sort(1)"><span data-i18n="thModel">型号</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="failedTM.sort(2)"><span data-i18n="thName">网关名称</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="failedTM.sort(3)"><span data-i18n="thApp">应用版本</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="failedTM.sort(4)"><span data-i18n="thVersion">版本</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="failedTM.sort(5)"><span data-i18n="thStatus">状态</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="failedTM.sort(6)"><span data-i18n="thSysUptime">系统运行时长(s)</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="failedTM.sort(7)"><span data-i18n="thSysUptimeStr">运行时长</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="failedTM.sort(8)"><span data-i18n="thError">错误信息</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+</tr></thead>
+<tbody id="failedBody"></tbody>
+</table>
+</div>
 </div>
 
 <!-- 全量网关明细 -->
 <div class="section-title" data-i18n="secDetail">全量网关明细</div>
 <div class="table-wrap">
-<div class="search-bar"><input type="text" id="searchInput" data-i18n-placeholder="searchPlaceholder" placeholder="搜索网关名称、MAC、厂家..." oninput="filterTable()"></div>
+<div class="search-bar"><input type="text" id="detailSearchInput" data-i18n-placeholder="searchPlaceholder" placeholder="搜索网关名称、MAC、厂家..." oninput="detailTM.filter()"></div>
 <div style="max-height:600px;overflow-y:auto;">
 <table id="detailTable">
 <thead><tr>
   <th>NO</th>
-  <th onclick="sortTable(0)">MAC <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
-  <th onclick="sortTable(1)"><span data-i18n="thName">网关名称</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
-  <th onclick="sortTable(2)">SN <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
-  <th onclick="sortTable(3)"><span data-i18n="thVendor">厂家</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
-  <th onclick="sortTable(4)" data-type="hex">EST_TYP_A <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
-  <th onclick="sortTable(5)" data-type="hex">EST_TYP_B <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
-  <th onclick="sortTable(6)" data-type="hex"><span data-i18n="thEol">EOL_INFO</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
-  <th onclick="sortTable(7)"><span data-i18n="thApp">应用版本</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
-  <th onclick="sortTable(8)"><span data-i18n="thVersion">版本</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
-  <th onclick="sortTable(9)"><span data-i18n="thStatus">状态</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
-  <th onclick="sortTable(10)"><span data-i18n="thUplink">连接方式</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(0)">MAC <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(1)"><span data-i18n="thModel">型号</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(2)"><span data-i18n="thName">网关名称</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(3)">SN <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(4)"><span data-i18n="thVendor">厂家</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(5)" data-type="hex">EST_TYP_A <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(6)" data-type="hex">EST_TYP_B <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(7)" data-type="hex"><span data-i18n="thEol">EOL_INFO</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(8)"><span data-i18n="thApp">应用版本</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(9)"><span data-i18n="thVersion">版本</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(10)"><span data-i18n="thStatus">状态</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(11)"><span data-i18n="thUplink">连接方式</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(12)"><span data-i18n="thSysUptime">系统运行时长(s)</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(13)"><span data-i18n="thSysUptimeStr">运行时长</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(14)"><span data-i18n="thSectorsRead">读扇区数</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(15)"><span data-i18n="thSectorsWritten">写扇区数</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(16)"><span data-i18n="thBytesRead">读字节数</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(17)"><span data-i18n="thBytesReadStr">读取量</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(18)"><span data-i18n="thBytesWritten">写字节数</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(19)"><span data-i18n="thBytesWrittenStr">写入量</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(20)"><span data-i18n="thAvgReadRate">平均读速率(B/s)</span><span class="th-tip" data-tip="数据来源: cat /proc/diskstats (mmcblk0p14)&#10;计算公式: SectorsRead × 512 ÷ Sys_Uptime&#10;单位: B/s&#10;含义: 自启动以来的累计平均读取速率" data-i18n-tip="tipAvgReadRate">?</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(21)"><span data-i18n="thAvgReadRateStr">平均读速率</span><span class="th-tip" data-tip="数据来源: cat /proc/diskstats (mmcblk0p14)&#10;计算公式: SectorsRead × 512 ÷ Sys_Uptime&#10;含义: 自启动以来的累计平均读取速率&#10;可读格式自动换算 KB/s, MB/s" data-i18n-tip="tipAvgReadRateStr">?</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(22)"><span data-i18n="thAvgWriteRate">平均写速率(B/s)</span><span class="th-tip" data-tip="数据来源: cat /proc/diskstats (mmcblk0p14)&#10;计算公式: SectorsWritten × 512 ÷ Sys_Uptime&#10;单位: B/s&#10;含义: 自启动以来的累计平均写入速率" data-i18n-tip="tipAvgWriteRate">?</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
+  <th onclick="detailTM.sort(23)"><span data-i18n="thAvgWriteRateStr">平均写速率</span><span class="th-tip" data-tip="数据来源: cat /proc/diskstats (mmcblk0p14)&#10;计算公式: SectorsWritten × 512 ÷ Sys_Uptime&#10;含义: 自启动以来的累计平均写入速率&#10;可读格式自动换算 KB/s, MB/s" data-i18n-tip="tipAvgWriteRateStr">?</span> <span class="sort-arrow">&#x25B4;&#x25BE;</span></th>
 </tr></thead>
-<tbody id="detailBody">
-</tbody>
+<tbody id="detailBody"></tbody>
 </table>
 </div>
 </div>
@@ -531,11 +568,11 @@ const I18N = {{
     metaGenTime: '生成时间', metaSource: '数据来源', metaTotal: '网关总数',
     metaOnline: '在线', metaVendors: 'eMMC 厂家',
     cardTotal: '网关总数', cardOnline: '在线网关', cardVendors: 'eMMC 厂家',
-    cardRisk: '风险网关 (\\u22650x07)',
+    cardRisk: '风险网关 (\\u22650x07)', cardFailed: '检测失败',
     secHealth: '健康等级概览 \\u2014 基于 EST_TYP_A 值分级，值越小越健康',
     secDist: 'EST_TYP_A 整体分布', secVendor: '按厂家 (devName) 分析',
-    secRisk: '风险网关清单', secDetail: '全量网关明细',
-    riskCount: '共 {len(risk_devices)} 台',
+    secRisk: '风险网关清单', secFailed: '失败网关详情', secDetail: '全量网关明细',
+    riskCount: '共 {len(risk_devices)} 台', failedCount: '共 {failed_count} 台',
     lvHealthy: '健康', lvGood: '良好', lvWarning: '警告', lvDanger: '危险',
     chartDistTitle: '网关数量 vs EST_TYP_A 值',
     chartPieTitle: '各厂家网关占比', chartAvgTitle: '各厂家平均 EST_TYP_A',
@@ -544,21 +581,34 @@ const I18N = {{
     axisAvgTypA: '平均 EST_TYP_A (十进制)', tipDevices: ' 台',
     labelDevCount: '网关数量', labelAvgTypA: '平均 EST_TYP_A',
     tipPieSuffix: ' 台',
-    thName: '网关名称', thVendor: '厂家', thVersion: '版本',
+    thModel: '型号', thName: '网关名称', thVendor: '厂家', thVersion: '版本',
     thStatus: '状态', thUplink: '连接方式', thApp: '应用版本', thEol: 'EOL_INFO',
-    searchPlaceholder: '搜索网关名称、MAC、厂家...',
-    noRisk: '无风险网关', toggleTheme: '切换主题', btnNewTab: '新标签页打开',
+    thSysUptime: '系统运行时长(s)', thSysUptimeStr: '运行时长', thError: '错误信息',
+    thSectorsRead: '读扇区数', thSectorsWritten: '写扇区数',
+    thBytesRead: '读字节数', thBytesReadStr: '读取量',
+    thBytesWritten: '写字节数', thBytesWrittenStr: '写入量',
+    thAvgReadRate: '平均读速率(B/s)', thAvgWriteRate: '平均写速率(B/s)',
+    thAvgReadRateStr: '平均读速率', thAvgWriteRateStr: '平均写速率',
+    tipAvgReadRate: '数据来源: cat /proc/diskstats (mmcblk0p14)\\n计算公式: SectorsRead × 512 ÷ Sys_Uptime\\n单位: B/s\\n含义: 自启动以来的累计平均读取速率',
+    tipAvgReadRateStr: '数据来源: cat /proc/diskstats (mmcblk0p14)\\n计算公式: SectorsRead × 512 ÷ Sys_Uptime\\n含义: 自启动以来的累计平均读取速率\\n可读格式自动换算 KB/s, MB/s',
+    tipAvgWriteRate: '数据来源: cat /proc/diskstats (mmcblk0p14)\\n计算公式: SectorsWritten × 512 ÷ Sys_Uptime\\n单位: B/s\\n含义: 自启动以来的累计平均写入速率',
+    tipAvgWriteRateStr: '数据来源: cat /proc/diskstats (mmcblk0p14)\\n计算公式: SectorsWritten × 512 ÷ Sys_Uptime\\n含义: 自启动以来的累计平均写入速率\\n可读格式自动换算 KB/s, MB/s',
+    searchPlaceholder: '搜索网关名称、MAC、型号、厂家...',
+    searchRiskPlaceholder: '搜索风险网关...',
+    searchFailedPlaceholder: '搜索失败网关...',
+    noRisk: '无风险网关', noFailed: '无失败网关',
+    toggleTheme: '切换主题', btnNewTab: '新标签页打开',
   }},
   en: {{
     title: 'eMMC Health Status Report',
     metaGenTime: 'Generated', metaSource: 'Data Source', metaTotal: 'Total Gateways',
     metaOnline: 'Online', metaVendors: 'eMMC Vendors',
     cardTotal: 'Total Gateways', cardOnline: 'Online Gateways', cardVendors: 'eMMC Vendors',
-    cardRisk: 'Risk Gateways (\\u22650x07)',
+    cardRisk: 'Risk Gateways (\\u22650x07)', cardFailed: 'Failed',
     secHealth: 'Health Level Overview \\u2014 Based on EST_TYP_A value, lower is healthier',
     secDist: 'EST_TYP_A Overall Distribution', secVendor: 'Analysis by Vendor (devName)',
-    secRisk: 'Risk Gateway List', secDetail: 'All Gateway Details',
-    riskCount: '{len(risk_devices)} total',
+    secRisk: 'Risk Gateway List', secFailed: 'Failed Gateway Details', secDetail: 'All Gateway Details',
+    riskCount: '{len(risk_devices)} total', failedCount: '{failed_count} total',
     lvHealthy: 'Healthy', lvGood: 'Good', lvWarning: 'Warning', lvDanger: 'Danger',
     chartDistTitle: 'Gateway Count vs EST_TYP_A',
     chartPieTitle: 'Gateway Share by Vendor', chartAvgTitle: 'Avg EST_TYP_A by Vendor',
@@ -567,21 +617,34 @@ const I18N = {{
     axisAvgTypA: 'Avg EST_TYP_A (decimal)', tipDevices: ' gateways',
     labelDevCount: 'Gateway Count', labelAvgTypA: 'Avg EST_TYP_A',
     tipPieSuffix: ' units',
-    thName: 'Gateway Name', thVendor: 'Vendor', thVersion: 'Version',
+    thModel: 'Model', thName: 'Gateway Name', thVendor: 'Vendor', thVersion: 'Version',
     thStatus: 'Status', thUplink: 'Uplink', thApp: 'App Version', thEol: 'EOL_INFO',
-    searchPlaceholder: 'Search name, MAC, vendor...',
-    noRisk: 'No risk gateways', toggleTheme: 'Toggle theme', btnNewTab: 'Open in new tab',
+    thSysUptime: 'Sys Uptime(s)', thSysUptimeStr: 'Uptime', thError: 'Error',
+    thSectorsRead: 'Sectors Read', thSectorsWritten: 'Sectors Written',
+    thBytesRead: 'Bytes Read', thBytesReadStr: 'Read Volume',
+    thBytesWritten: 'Bytes Written', thBytesWrittenStr: 'Write Volume',
+    thAvgReadRate: 'Avg Read Rate(B/s)', thAvgWriteRate: 'Avg Write Rate(B/s)',
+    thAvgReadRateStr: 'Avg Read Rate', thAvgWriteRateStr: 'Avg Write Rate',
+    tipAvgReadRate: 'Source: cat /proc/diskstats (mmcblk0p14)\\nFormula: SectorsRead × 512 ÷ Sys_Uptime\\nUnit: B/s\\nMeaning: Cumulative avg read rate since boot',
+    tipAvgReadRateStr: 'Source: cat /proc/diskstats (mmcblk0p14)\\nFormula: SectorsRead × 512 ÷ Sys_Uptime\\nMeaning: Cumulative avg read rate since boot\\nAuto-scaled to KB/s, MB/s',
+    tipAvgWriteRate: 'Source: cat /proc/diskstats (mmcblk0p14)\\nFormula: SectorsWritten × 512 ÷ Sys_Uptime\\nUnit: B/s\\nMeaning: Cumulative avg write rate since boot',
+    tipAvgWriteRateStr: 'Source: cat /proc/diskstats (mmcblk0p14)\\nFormula: SectorsWritten × 512 ÷ Sys_Uptime\\nMeaning: Cumulative avg write rate since boot\\nAuto-scaled to KB/s, MB/s',
+    searchPlaceholder: 'Search name, MAC, model, vendor...',
+    searchRiskPlaceholder: 'Search risk gateways...',
+    searchFailedPlaceholder: 'Search failed gateways...',
+    noRisk: 'No risk gateways', noFailed: 'No failed gateways',
+    toggleTheme: 'Toggle theme', btnNewTab: 'Open in new tab',
   }},
   ja: {{
     title: 'eMMC 健康状態分析レポート',
     metaGenTime: '生成日時', metaSource: 'データソース', metaTotal: 'ゲートウェイ総数',
     metaOnline: 'オンライン', metaVendors: 'eMMC ベンダー',
     cardTotal: 'ゲートウェイ総数', cardOnline: 'オンラインGW', cardVendors: 'eMMC ベンダー',
-    cardRisk: 'リスクGW (\\u22650x07)',
+    cardRisk: 'リスクGW (\\u22650x07)', cardFailed: '失敗GW',
     secHealth: '健康レベル概要 \\u2014 EST_TYP_A値に基づく分類、値が小さいほど健康',
     secDist: 'EST_TYP_A 全体分布', secVendor: 'ベンダー (devName) 別分析',
-    secRisk: 'リスクGW一覧', secDetail: '全GW明細',
-    riskCount: '合計 {len(risk_devices)} 台',
+    secRisk: 'リスクGW一覧', secFailed: '失敗GW詳細', secDetail: '全GW明細',
+    riskCount: '合計 {len(risk_devices)} 台', failedCount: '合計 {failed_count} 台',
     lvHealthy: '健康', lvGood: '良好', lvWarning: '警告', lvDanger: '危険',
     chartDistTitle: 'GW数 vs EST_TYP_A値',
     chartPieTitle: 'ベンダー別GW割合', chartAvgTitle: 'ベンダー別平均 EST_TYP_A',
@@ -590,10 +653,23 @@ const I18N = {{
     axisAvgTypA: '平均 EST_TYP_A (10進)', tipDevices: ' GW',
     labelDevCount: 'GW数', labelAvgTypA: '平均 EST_TYP_A',
     tipPieSuffix: ' 台',
-    thName: 'GW名', thVendor: 'ベンダー', thVersion: 'バージョン',
+    thModel: 'モデル', thName: 'GW名', thVendor: 'ベンダー', thVersion: 'バージョン',
     thStatus: 'ステータス', thUplink: '接続方式', thApp: 'アプリバージョン', thEol: 'EOL_INFO',
-    searchPlaceholder: 'GW名、MAC、ベンダーを検索...',
-    noRisk: 'リスクGWなし', toggleTheme: 'テーマ切替', btnNewTab: '新しいタブで開く',
+    thSysUptime: 'システム稼働時間(s)', thSysUptimeStr: '稼働時間', thError: 'エラー',
+    thSectorsRead: '読込セクタ数', thSectorsWritten: '書込セクタ数',
+    thBytesRead: '読込バイト数', thBytesReadStr: '読取量',
+    thBytesWritten: '書込バイト数', thBytesWrittenStr: '書込量',
+    thAvgReadRate: '平均読込速度(B/s)', thAvgWriteRate: '平均書込速度(B/s)',
+    thAvgReadRateStr: '平均読込速度', thAvgWriteRateStr: '平均書込速度',
+    tipAvgReadRate: 'データソース: cat /proc/diskstats (mmcblk0p14)\\n計算式: SectorsRead × 512 ÷ Sys_Uptime\\n単位: B/s\\n意味: 起動以来の累計平均読込速度',
+    tipAvgReadRateStr: 'データソース: cat /proc/diskstats (mmcblk0p14)\\n計算式: SectorsRead × 512 ÷ Sys_Uptime\\n意味: 起動以来の累計平均読込速度\\n可読形式 (KB/s, MB/s) 自動変換',
+    tipAvgWriteRate: 'データソース: cat /proc/diskstats (mmcblk0p14)\\n計算式: SectorsWritten × 512 ÷ Sys_Uptime\\n単位: B/s\\n意味: 起動以来の累計平均書込速度',
+    tipAvgWriteRateStr: 'データソース: cat /proc/diskstats (mmcblk0p14)\\n計算式: SectorsWritten × 512 ÷ Sys_Uptime\\n意味: 起動以来の累計平均書込速度\\n可読形式 (KB/s, MB/s) 自動変換',
+    searchPlaceholder: 'GW名、MAC、モデル、ベンダーを検索...',
+    searchRiskPlaceholder: 'リスクGWを検索...',
+    searchFailedPlaceholder: '失敗GWを検索...',
+    noRisk: 'リスクGWなし', noFailed: '失敗GWなし',
+    toggleTheme: 'テーマ切替', btnNewTab: '新しいタブで開く',
   }},
 }};
 let curLang = 'zh';
@@ -604,33 +680,31 @@ function switchLang(lang) {{
   curLang = lang;
   const langMap = {{ zh: 'zh-CN', en: 'en', ja: 'ja' }};
   document.documentElement.lang = langMap[lang] || lang;
-  // 更新按钮 active 状态
   document.querySelectorAll('.lang-btn').forEach(b => {{
     b.classList.toggle('active', b.textContent.trim() === (lang === 'zh' ? '中' : lang === 'en' ? 'EN' : 'JP'));
   }});
-  // 更新 data-i18n 文本
   document.querySelectorAll('[data-i18n]').forEach(el => {{
     const key = el.getAttribute('data-i18n');
     const val = t(key);
     if (val !== key) el.innerHTML = val;
   }});
-  // 更新 placeholder
   document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {{
     const key = el.getAttribute('data-i18n-placeholder');
     el.placeholder = t(key);
   }});
-  // 更新主题按钮 title & 浏览器标签
+  document.querySelectorAll('[data-i18n-tip]').forEach(el => {{
+    const key = el.getAttribute('data-i18n-tip');
+    const val = t(key);
+    if (val !== key) el.setAttribute('data-tip', val);
+  }});
   document.querySelector('.theme-btn').title = t('toggleTheme');
   document.title = t('title');
-  // 更新 LEVELS 名称
   LEVELS[0].name = t('lvHealthy');
   LEVELS[1].name = t('lvGood');
   LEVELS[2].name = t('lvWarning');
   LEVELS[3].name = t('lvDanger');
-  // 更新图表文本
   updateChartLang();
-  // 重新渲染明细表
-  renderDetailTable(RAW_DATA);
+  riskTM.render(); failedTM.render(); detailTM.render();
 }}
 
 function updateChartLang() {{
@@ -656,7 +730,7 @@ function updateChartLang() {{
       c.data.datasets[3].label = t('lvDanger');
     }} else if (cid === 'chartPie') {{
       c.options.plugins.tooltip.callbacks.label = ctx =>
-        ctx.label + ': ' + ctx.parsed + t('tipPieSuffix') + ' (' + (ctx.parsed/{total}*100).toFixed(1) + '%)';
+        ctx.label + ': ' + ctx.parsed + t('tipPieSuffix') + ' (' + (ctx.parsed/{max(valid_count, 1)}*100).toFixed(1) + '%)';
     }}
     c.update('none');
   }});
@@ -701,6 +775,8 @@ function applyChartTheme() {{
 
 // ── 嵌入原始数据 ──────────────────────────────────────
 const RAW_DATA = {data_json};
+const RISK_DATA = {risk_json};
+const FAILED_DATA = {failed_json};
 
 // ── 健康等级映射 ──────────────────────────────────────
 const LEVELS = [
@@ -722,8 +798,13 @@ function esc(s) {{
     d.appendChild(document.createTextNode(s));
     return d.innerHTML;
 }}
+function macCell(mac) {{
+    if (!mac) return '';
+    const macFile = mac.replace(/:/g, '-');
+    return '<span class="mac-link" onclick="showScreenshot(\\x27' + esc(macFile) + '\\x27,\\x27' + esc(mac) + '\\x27,this)">' + esc(mac) + '</span>';
+}}
 
-// ── Chart.js 全局配置 (深色主题) ──────────────────────
+// ── Chart.js 全局配置 ─────────────────────────────────
 Chart.defaults.color = '#94a3b8';
 Chart.defaults.borderColor = 'rgba(255,255,255,0.06)';
 Chart.defaults.font.family = '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif';
@@ -765,7 +846,7 @@ new Chart(document.getElementById('chartPie'), {{
         responsive: true,
         plugins: {{
             legend: {{ position: 'bottom' }},
-            tooltip: {{ callbacks: {{ label: ctx => ctx.label + ': ' + ctx.parsed + t('tipPieSuffix') + ' (' + (ctx.parsed/{total}*100).toFixed(1) + '%)' }} }}
+            tooltip: {{ callbacks: {{ label: ctx => ctx.label + ': ' + ctx.parsed + t('tipPieSuffix') + ' (' + (ctx.parsed/{max(valid_count, 1)}*100).toFixed(1) + '%)' }} }}
         }}
     }}
 }});
@@ -853,65 +934,139 @@ new Chart(document.getElementById('chartStacked'), {{
     }}
 }});
 
-// ── 全量明细表渲染 ───────────────────────────────────
-let currentDataset = RAW_DATA;
-function renderDetailTable(dataset) {{
-    const tbody = document.getElementById('detailBody');
-    let html = '';
-    for (let i = 0; i < dataset.length; i++) {{
-        const d = dataset[i];
-        const v = hexToInt(d.EST_TYP_A || '0x00');
-        const lv = getLevel(v);
-        const mac = d.mac || '';
-        const macFile = mac.replace(/:/g, '-');
-        const macCell = mac ? '<span class="mac-link" onclick="showScreenshot(\\x27' + esc(macFile) + '\\x27,\\x27' + esc(mac) + '\\x27,this)">' + esc(mac) + '</span>' : '';
-        html += '<tr>' +
-            '<td>' + (i + 1) + '</td>' +
-            '<td>' + macCell + '</td>' +
-            '<td>' + esc(d.name||'') + '</td>' +
-            '<td>' + esc(d.sn||'') + '</td>' +
-            '<td>' + esc(d.devName||'') + '</td>' +
-            '<td><span class="badge '+lv.cls+'">' + esc(d.EST_TYP_A||'') + ' (' + v + ')</span></td>' +
-            '<td>' + esc(d.EST_TYP_B||'') + '</td>' +
-            '<td>' + esc(d.EOL_INFO||'') + '</td>' +
-            '<td>' + esc(d.appVersion||'') + '</td>' +
-            '<td>' + esc(d.version||'') + '</td>' +
-            '<td>' + esc(d.status||'') + '</td>' +
-            '<td>' + esc(d.uplink||'') + '</td>' +
-            '</tr>';
+// ── 通用表格管理器工厂 ────────────────────────────────
+function createTableManager(rawData, tbodyId, searchInputId, columns, opts) {{
+    opts = opts || {{}};
+    let dataset = rawData;
+    let sortCol = -1, sortAsc = true;
+
+    function render(ds) {{
+        if (ds) dataset = ds;
+        const tbody = document.getElementById(tbodyId);
+        let html = '';
+        for (let i = 0; i < dataset.length; i++) {{
+            const d = dataset[i];
+            html += '<tr><td>' + (i + 1) + '</td>';
+            for (const col of columns) {{
+                html += col.render(d);
+            }}
+            html += '</tr>';
+        }}
+        tbody.innerHTML = html || '<tr><td colspan="' + (columns.length + 1) + '" style="text-align:center;color:var(--text-dim);padding:24px;">' + (opts.emptyText || '') + '</td></tr>';
     }}
-    tbody.innerHTML = html;
-}}
-renderDetailTable(RAW_DATA);
 
-// ── 搜索过滤 ─────────────────────────────────────────
-function filterTable() {{
-    const q = document.getElementById('searchInput').value.toLowerCase();
-    currentDataset = RAW_DATA.filter(d =>
-        (d.name||'').toLowerCase().includes(q) ||
-        (d.mac||'').toLowerCase().includes(q) ||
-        (d.devName||'').toLowerCase().includes(q) ||
-        (d.sn||'').toLowerCase().includes(q) ||
-        (d.appVersion||'').toLowerCase().includes(q) ||
-        (d.EOL_INFO||'').toLowerCase().includes(q)
-    );
-    renderDetailTable(currentDataset);
+    function filter() {{
+        const q = document.getElementById(searchInputId).value.toLowerCase();
+        const searchFields = opts.searchFields || [];
+        dataset = rawData.filter(d => {{
+            for (const f of searchFields) {{
+                if ((d[f] || '').toString().toLowerCase().includes(q)) return true;
+            }}
+            return false;
+        }});
+        render();
+    }}
+
+    function sort(colIdx) {{
+        if (sortCol === colIdx) {{ sortAsc = !sortAsc; }} else {{ sortCol = colIdx; sortAsc = true; }}
+        const col = columns[colIdx];
+        const key = col.key;
+        const isHex = col.hex || false;
+        const isNum = col.num || false;
+        dataset = [...dataset].sort((a, b) => {{
+            let va = a[key] || '', vb = b[key] || '';
+            if (isHex) {{ va = hexToInt(va); vb = hexToInt(vb); return sortAsc ? va - vb : vb - va; }}
+            if (isNum) {{ va = Number(va) || 0; vb = Number(vb) || 0; return sortAsc ? va - vb : vb - va; }}
+            return sortAsc ? String(va).localeCompare(String(vb)) : String(vb).localeCompare(String(va));
+        }});
+        render();
+    }}
+
+    render();
+    return {{ render, filter, sort }};
 }}
 
-// ── 排序 ──────────────────────────────────────────────
-let sortCol = -1, sortAsc = true;
-function sortTable(colIdx) {{
-    if (sortCol === colIdx) {{ sortAsc = !sortAsc; }} else {{ sortCol = colIdx; sortAsc = true; }}
-    const keys = ['mac','name','sn','devName','EST_TYP_A','EST_TYP_B','EOL_INFO','appVersion','version','status','uplink'];
-    const key = keys[colIdx];
-    const isHex = (key === 'EST_TYP_A' || key === 'EST_TYP_B' || key === 'EOL_INFO');
-    currentDataset = [...currentDataset].sort((a, b) => {{
-        let va = a[key] || '', vb = b[key] || '';
-        if (isHex) {{ va = hexToInt(va); vb = hexToInt(vb); return sortAsc ? va - vb : vb - va; }}
-        return sortAsc ? va.localeCompare(vb) : vb.localeCompare(va);
-    }});
-    renderDetailTable(currentDataset);
-}}
+// ── 风险表 ────────────────────────────────────────────
+const riskTM = createTableManager(RISK_DATA, 'riskBody', 'riskSearchInput', [
+    {{ key:'mac', render: d => '<td>' + macCell(d.mac||'') + '</td>' }},
+    {{ key:'model', render: d => '<td>' + esc(d.model||'') + '</td>' }},
+    {{ key:'name', render: d => '<td>' + esc(d.name||'') + '</td>' }},
+    {{ key:'devName', render: d => '<td>' + esc(d.devName||'') + '</td>' }},
+    {{ key:'EST_TYP_A', hex:true, render: d => {{
+        const v = hexToInt(d.EST_TYP_A||'0x00'); const lv = getLevel(v);
+        return '<td><span class="badge '+lv.cls+'">' + esc(d.EST_TYP_A||'') + ' (' + v + ')</span></td>';
+    }} }},
+    {{ key:'EST_TYP_B', hex:true, render: d => '<td>' + esc(d.EST_TYP_B||'') + '</td>' }},
+    {{ key:'EOL_INFO', hex:true, render: d => '<td>' + esc(d.EOL_INFO||'') + '</td>' }},
+    {{ key:'appVersion', render: d => '<td>' + esc(d.appVersion||'') + '</td>' }},
+    {{ key:'version', render: d => '<td>' + esc(d.version||'') + '</td>' }},
+    {{ key:'status', render: d => '<td>' + esc(d.status||'') + '</td>' }},
+    {{ key:'sys_uptime', num:true, render: d => '<td>' + esc(String(d.sys_uptime||'')) + '</td>' }},
+    {{ key:'sys_uptime_str', render: d => '<td>' + esc(d.sys_uptime_str||'') + '</td>' }},
+    {{ key:'ds_sectors_read', num:true, render: d => '<td>' + esc(String(d.ds_sectors_read||'')) + '</td>' }},
+    {{ key:'ds_sectors_written', num:true, render: d => '<td>' + esc(String(d.ds_sectors_written||'')) + '</td>' }},
+    {{ key:'ds_bytes_read', num:true, render: d => '<td>' + (d.ds_bytes_read !== '' && d.ds_bytes_read != null ? Number(d.ds_bytes_read) : '') + '</td>' }},
+    {{ key:'ds_bytes_read_str', render: d => '<td>' + esc(d.ds_bytes_read_str||'') + '</td>' }},
+    {{ key:'ds_bytes_written', num:true, render: d => '<td>' + (d.ds_bytes_written !== '' && d.ds_bytes_written != null ? Number(d.ds_bytes_written) : '') + '</td>' }},
+    {{ key:'ds_bytes_written_str', render: d => '<td>' + esc(d.ds_bytes_written_str||'') + '</td>' }},
+    {{ key:'ds_avg_read_rate', num:true, render: d => '<td>' + (d.ds_avg_read_rate !== '' && d.ds_avg_read_rate != null ? Number(d.ds_avg_read_rate).toFixed(2) : '') + '</td>' }},
+    {{ key:'ds_avg_read_rate_str', render: d => '<td>' + esc(d.ds_avg_read_rate_str||'') + '</td>' }},
+    {{ key:'ds_avg_write_rate', num:true, render: d => '<td>' + (d.ds_avg_write_rate !== '' && d.ds_avg_write_rate != null ? Number(d.ds_avg_write_rate).toFixed(2) : '') + '</td>' }},
+    {{ key:'ds_avg_write_rate_str', render: d => '<td>' + esc(d.ds_avg_write_rate_str||'') + '</td>' }},
+], {{
+    searchFields: ['mac','model','name','devName','appVersion','EST_TYP_A','EOL_INFO','ds_bytes_read_str','ds_bytes_written_str','ds_avg_read_rate_str','ds_avg_write_rate_str'],
+    emptyText: t('noRisk'),
+}});
+
+// ── 失败表 ────────────────────────────────────────────
+const failedTM = createTableManager(FAILED_DATA, 'failedBody', 'failedSearchInput', [
+    {{ key:'mac', render: d => '<td>' + macCell(d.mac||'') + '</td>' }},
+    {{ key:'model', render: d => '<td>' + esc(d.model||'') + '</td>' }},
+    {{ key:'name', render: d => '<td>' + esc(d.name||'') + '</td>' }},
+    {{ key:'appVersion', render: d => '<td>' + esc(d.appVersion||'') + '</td>' }},
+    {{ key:'version', render: d => '<td>' + esc(d.version||'') + '</td>' }},
+    {{ key:'status', render: d => '<td>' + esc(d.status||'') + '</td>' }},
+    {{ key:'sys_uptime', num:true, render: d => '<td>' + esc(String(d.sys_uptime||'')) + '</td>' }},
+    {{ key:'sys_uptime_str', render: d => '<td>' + esc(d.sys_uptime_str||'') + '</td>' }},
+    {{ key:'_error', render: d => '<td style="white-space:normal;max-width:300px;">' + esc(d._error||'') + '</td>' }},
+], {{
+    searchFields: ['mac','model','name','appVersion','_error'],
+    emptyText: t('noFailed'),
+}});
+
+// ── 全量明细表 ────────────────────────────────────────
+const detailTM = createTableManager(RAW_DATA, 'detailBody', 'detailSearchInput', [
+    {{ key:'mac', render: d => '<td>' + macCell(d.mac||'') + '</td>' }},
+    {{ key:'model', render: d => '<td>' + esc(d.model||'') + '</td>' }},
+    {{ key:'name', render: d => '<td>' + esc(d.name||'') + '</td>' }},
+    {{ key:'sn', render: d => '<td>' + esc(d.sn||'') + '</td>' }},
+    {{ key:'devName', render: d => '<td>' + esc(d.devName||'') + '</td>' }},
+    {{ key:'EST_TYP_A', hex:true, render: d => {{
+        const v = hexToInt(d.EST_TYP_A||'0x00'); const lv = getLevel(v);
+        return '<td><span class="badge '+lv.cls+'">' + esc(d.EST_TYP_A||'') + ' (' + v + ')</span></td>';
+    }} }},
+    {{ key:'EST_TYP_B', hex:true, render: d => '<td>' + esc(d.EST_TYP_B||'') + '</td>' }},
+    {{ key:'EOL_INFO', hex:true, render: d => '<td>' + esc(d.EOL_INFO||'') + '</td>' }},
+    {{ key:'appVersion', render: d => '<td>' + esc(d.appVersion||'') + '</td>' }},
+    {{ key:'version', render: d => '<td>' + esc(d.version||'') + '</td>' }},
+    {{ key:'status', render: d => '<td>' + esc(d.status||'') + '</td>' }},
+    {{ key:'uplink', render: d => '<td>' + esc(d.uplink||'') + '</td>' }},
+    {{ key:'sys_uptime', num:true, render: d => '<td>' + esc(String(d.sys_uptime||'')) + '</td>' }},
+    {{ key:'sys_uptime_str', render: d => '<td>' + esc(d.sys_uptime_str||'') + '</td>' }},
+    {{ key:'ds_sectors_read', num:true, render: d => '<td>' + esc(String(d.ds_sectors_read||'')) + '</td>' }},
+    {{ key:'ds_sectors_written', num:true, render: d => '<td>' + esc(String(d.ds_sectors_written||'')) + '</td>' }},
+    {{ key:'ds_bytes_read', num:true, render: d => '<td>' + (d.ds_bytes_read !== '' && d.ds_bytes_read != null ? Number(d.ds_bytes_read) : '') + '</td>' }},
+    {{ key:'ds_bytes_read_str', render: d => '<td>' + esc(d.ds_bytes_read_str||'') + '</td>' }},
+    {{ key:'ds_bytes_written', num:true, render: d => '<td>' + (d.ds_bytes_written !== '' && d.ds_bytes_written != null ? Number(d.ds_bytes_written) : '') + '</td>' }},
+    {{ key:'ds_bytes_written_str', render: d => '<td>' + esc(d.ds_bytes_written_str||'') + '</td>' }},
+    {{ key:'ds_avg_read_rate', num:true, render: d => '<td>' + (d.ds_avg_read_rate !== '' && d.ds_avg_read_rate != null ? Number(d.ds_avg_read_rate).toFixed(2) : '') + '</td>' }},
+    {{ key:'ds_avg_read_rate_str', render: d => '<td>' + esc(d.ds_avg_read_rate_str||'') + '</td>' }},
+    {{ key:'ds_avg_write_rate', num:true, render: d => '<td>' + (d.ds_avg_write_rate !== '' && d.ds_avg_write_rate != null ? Number(d.ds_avg_write_rate).toFixed(2) : '') + '</td>' }},
+    {{ key:'ds_avg_write_rate_str', render: d => '<td>' + esc(d.ds_avg_write_rate_str||'') + '</td>' }},
+], {{
+    searchFields: ['mac','model','name','sn','devName','appVersion','EOL_INFO','ds_bytes_read_str','ds_bytes_written_str','ds_avg_read_rate_str','ds_avg_write_rate_str'],
+    emptyText: '',
+}});
 
 // ── 截图浮窗 ──────────────────────────────────────────
 let _screenshotSrc = '';
@@ -921,7 +1076,6 @@ function _clearHighlight() {{
 }}
 function showScreenshot(macFile, macDisplay, el) {{
     _screenshotSrc = 'screenshots/' + macFile + '.png';
-    // 高亮对应行
     _clearHighlight();
     if (el) {{
         const tr = el.closest('tr');
@@ -936,11 +1090,9 @@ function showScreenshot(macFile, macDisplay, el) {{
     body.innerHTML = '<div class="img-error" data-i18n="imgLoading">加载中...</div>';
     modal.classList.add('show');
     overlay.classList.add('show');
-    // 顶部居中定位
     const mw = Math.min(1100, window.innerWidth * 0.96);
     modal.style.left = Math.max(0, (window.innerWidth - mw) / 2) + 'px';
     modal.style.top = '20px';
-    // 加载图片
     const img = new Image();
     img.onload = function() {{
         body.innerHTML = '';
@@ -961,7 +1113,6 @@ function closeScreenshot() {{
 function openScreenshotNewTab() {{
     if (_screenshotSrc) window.open(_screenshotSrc, '_blank');
 }}
-// ESC 关闭浮窗
 document.addEventListener('keydown', function(e) {{
     if (e.key === 'Escape') closeScreenshot();
 }});
@@ -986,7 +1137,6 @@ document.addEventListener('keydown', function(e) {{
         modal.style.top = (origY + e.clientY - startY) + 'px';
     }});
     document.addEventListener('mouseup', function() {{ isDragging = false; }});
-    // 触摸设备支持
     header.addEventListener('touchstart', function(e) {{
         if (e.target.closest('.img-modal-close')) return;
         const touch = e.touches[0];
@@ -1012,7 +1162,7 @@ document.addEventListener('keydown', function(e) {{
         f.write(html)
 
     print(f"报告已生成: {OUTPUT_FILE}")
-    print(f"总网关: {total}, 在线: {online_count}, 厂家: {vendor_count}, 风险网关: {len(risk_devices)}")
+    print(f"总网关: {total}, 在线: {online_count}, 厂家: {vendor_count}, 风险: {len(risk_devices)}, 失败: {failed_count}")
 
 
 if __name__ == "__main__":

@@ -31,5 +31,10 @@
     "wait_after_action_ms": 1000,
     "diff_threshold": 0.6,
     "context_max_messages": 40
+  },
+  "test": {
+    "output_dir": "tests/generated",
+    "default_timeout": 10000,
+    "max_verify_retries": 2
   }
 }

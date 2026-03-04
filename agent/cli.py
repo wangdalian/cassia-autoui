@@ -9,11 +9,14 @@ Agent 终端交互入口
 """
 
 import argparse
+import atexit
 import json
 import logging
 import os
+import signal
 import sys
 import time
+import traceback
 
 from playwright.sync_api import sync_playwright
 from prompt_toolkit import PromptSession
@@ -212,6 +215,23 @@ def main():
     _console.print("─" * 56, style="#5C6370")
     print()
 
+    def _atexit_handler():
+        logger.warning("[BrowserLifecycle] CLI Python 进程正在退出 (atexit)")
+
+    atexit.register(_atexit_handler)
+
+    def _signal_handler(signum, frame):
+        sig_name = signal.Signals(signum).name
+        logger.error(
+            "[BrowserLifecycle] CLI 收到信号 %s, 进程即将退出。调用栈:\n%s",
+            sig_name,
+            "".join(traceback.format_stack(frame)),
+        )
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _signal_handler)
+
     # 启动浏览器
     cprint("正在启动浏览器...", Colors.YELLOW)
 
@@ -221,20 +241,36 @@ def main():
         profile_dir = os.path.join(PROJECT_ROOT, ".browser_profile")
         browser_mgr.launch(pw, profile_dir)
 
-        page = browser_mgr.page
-        cprint(f"浏览器已就绪，当前页面: {page.url}", Colors.GREEN)
+        cprint(f"浏览器已就绪，当前页面: {browser_mgr.page.url}", Colors.GREEN)
         cprint("")
 
-        # 创建 Agent
-        agent = CassiaAgent(
-            page=page,
-            config=config,
-            on_thinking=on_thinking,
-            on_thinking_chunk=on_thinking_chunk,
-            on_tool_call=on_tool_call,
-            on_thinking_stream_start=on_thinking_stream_start,
-            on_thinking_stream_end=on_thinking_stream_end,
-        )
+        def create_agent(p):
+            return CassiaAgent(
+                page=p,
+                config=config,
+                on_thinking=on_thinking,
+                on_thinking_chunk=on_thinking_chunk,
+                on_tool_call=on_tool_call,
+                on_thinking_stream_start=on_thinking_stream_start,
+                on_thinking_stream_end=on_thinking_stream_end,
+            )
+
+        def recover_browser():
+            nonlocal browser_mgr, agent
+            cprint("浏览器已关闭，正在自动恢复...", Colors.YELLOW)
+            try:
+                browser_mgr.close()
+                browser_mgr = BrowserManager(config)
+                browser_mgr.launch(pw, profile_dir)
+                agent = create_agent(browser_mgr.page)
+                cprint("浏览器已自动恢复", Colors.GREEN)
+                return True
+            except Exception as exc:
+                logger.error(f"浏览器恢复失败: {exc}", exc_info=True)
+                cprint(f"浏览器恢复失败: {exc}", Colors.RED)
+                return False
+
+        agent = create_agent(browser_mgr.page)
 
         # 交互循环
         cprint("输入你的指令 (输入 quit/exit 退出, reset 重置对话):", Colors.YELLOW)
@@ -246,7 +282,12 @@ def main():
         while True:
             try:
                 user_input = pt_session.prompt("> ", in_thread=True).strip()
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
+                logger.warning("[BrowserLifecycle] CLI 收到 EOFError，退出交互循环")
+                cprint("\n再见!", Colors.YELLOW)
+                break
+            except KeyboardInterrupt:
+                logger.warning("[BrowserLifecycle] CLI 收到 KeyboardInterrupt，退出交互循环")
                 cprint("\n再见!", Colors.YELLOW)
                 break
 
@@ -254,6 +295,7 @@ def main():
                 continue
 
             if user_input.lower() in ("quit", "exit", "q"):
+                logger.warning("[BrowserLifecycle] CLI 用户输入 %s，退出交互循环", user_input)
                 cprint("再见!", Colors.YELLOW)
                 break
 
@@ -263,13 +305,12 @@ def main():
                 continue
 
             if user_input.lower() == "snapshot":
-                # 调试命令: 显示当前页面快照
-                text = agent.snapshot.get_full_snapshot(page)
+                text = agent.snapshot.get_full_snapshot(browser_mgr.page)
                 cprint(text, Colors.DIM)
                 continue
 
             if user_input.lower() == "url":
-                cprint(f"当前 URL: {page.url}", Colors.DIM)
+                cprint(f"当前 URL: {browser_mgr.page.url}", Colors.DIM)
                 continue
 
             # 执行 Agent 任务
@@ -280,12 +321,23 @@ def main():
             start_time = time.time()
 
             try:
+                if not browser_mgr.is_alive():
+                    if not recover_browser():
+                        continue
                 result = agent.run(user_input)
             except Exception as e:
-                result = f"执行出错: {e}"
-                logger.error(f"Agent 执行异常: {e}", exc_info=True)
-                # 确保异常时也关闭 Live 上下文
-                on_thinking_stream_end("")
+                err_msg = str(e)
+                if "has been closed" in err_msg or "Target closed" in err_msg:
+                    logger.warning(f"[CLI] 执行中浏览器关闭: {e}")
+                    on_thinking_stream_end("")
+                    if recover_browser():
+                        result = "浏览器已自动恢复，请重新输入指令"
+                    else:
+                        result = f"浏览器关闭且恢复失败: {e}"
+                else:
+                    result = f"执行出错: {e}"
+                    logger.error(f"Agent 执行异常: {e}", exc_info=True)
+                    on_thinking_stream_end("")
 
             elapsed = time.time() - start_time
             cprint(f"{'─' * 40}", Colors.DIM)
@@ -297,8 +349,10 @@ def main():
             cprint(f"(耗时 {elapsed:.1f}s)\n", Colors.DIM)
 
         # 清理
-        agent.executor.cleanup()  # 清理临时缓存文件
+        logger.warning("[BrowserLifecycle] CLI 交互循环结束，开始清理")
+        agent.executor.cleanup()
         browser_mgr.close()
+        logger.warning("[BrowserLifecycle] CLI 清理完成，即将退出 sync_playwright 上下文")
 
 
 if __name__ == "__main__":

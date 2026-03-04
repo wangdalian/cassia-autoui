@@ -27,6 +27,9 @@ def build_system_prompt(config: dict) -> str:
     # 加载 AC API 文档摘要
     ac_api_summary = _load_ac_api_summary()
 
+    # 加载网关 HTTP API 文档（BLE + 管理）
+    gateway_api_summary = _load_gateway_api_summary()
+
     # 加载 CLI 工具摘要
     cli_summary = _load_cli_summary()
 
@@ -110,22 +113,11 @@ heading "Dashboard" level=1
 ### 任务完成
 - `done(summary)`: 任务完成，报告结果
 
-## AC 平台页面路由
-
-UI 操作时，优先使用 browser_goto 直接导航到目标页面（路径必须携带 ?view 后缀，否则会变成 API 调用）：
-
-- Dashboard (仪表盘): /dashboard?view
-- Gateways (网关列表): /ap?view
-- Devices (设备列表): /cassia/hubble?view
-- Events (事件日志): /event?view
-- Settings (系统设置): /setting?view
-- Firmware (固件管理): /firmware?view
-
 ## 工具选择策略
 
 **API 优先，UI 兜底。** 执行任务时按以下优先级选择工具：
 
-1. **首选 API**: 如果任务可通过 fetch_gateways 或 ac_api_call 完成（如查询网关列表、获取事件日志、修改设置），直接调用 API，响应快、结果精确
+1. **首选 API**: 如果任务可通过 fetch_gateways 或 ac_api_call 完成（如查询网关列表、获取设备列表、获取事件日志、修改设置），直接调用 API，响应快、结果精确
 2. **其次 SSH**: 如果需要在网关上执行命令（如 show version、cassia CLI），使用 ssh_to_gateway + run_gateway_command（M/Z 系列网关不支持 SSH）
 3. **最后 UI**: 只在以下情况使用 browser_* 工具：
    - 任务需要与 UI 特有功能交互（如上传文件、查看图表/仪表盘）
@@ -135,6 +127,7 @@ UI 操作时，优先使用 browser_goto 直接导航到目标页面（路径必
 常见任务 -> 推荐工具映射：
 - 查看网关列表/状态 → fetch_gateways() 或 ac_api_call(GET, /ap)
 - 查询单个网关详情 → ac_api_call(GET, /ap/{{mac}})，比获取完整列表更高效
+- 查看/扫描设备列表 → ac_api_call(GET, /device)，返回已连接和已检测到的设备
 - 查看事件日志 → ac_api_call(GET, /event)，数据量大时自动缓存，再用 search_data 按关键词筛选
 - 查看/修改设置 → ac_api_call(GET|PUT, /setting)
 - 查看固件列表 → ac_api_call(GET, /firmware)
@@ -148,7 +141,7 @@ UI 操作时，优先使用 browser_goto 直接导航到目标页面（路径必
   2) 取 firmware.router[].id (UUID) 作为 firmware 参数
   3) ac_api_call(POST, /ap/*/upgrade, content_type="form", body={{"macs[]":[...], "firmware":"UUID"}})
   4) 轮询 ac_api_call(GET, /ap/{{mac}})，直到 update_status 为 "update_ok" 或 "update_fail"
-- 调用网关自身 API → ac_api_call(GET|POST, /api2/{{网关API路径}}, query="mac={{MAC}}")，参考 cassia-spec 中 gateway HTTP API 文档
+- 调用网关自身 API → ac_api_call(GET|POST, /api2/{{网关API路径}}, query="mac={{MAC}}")，参考下方网关 HTTP API 参考
 - 执行网关命令 → ssh_to_gateway + run_gateway_command（M/Z 系列不支持）
 - eMMC 健康检查（单个）→ ssh_to_gateway + check_emmc_health
 - eMMC 批量检查 → batch_check_emmc（自动处理连接/检查/报告）
@@ -156,6 +149,17 @@ UI 操作时，优先使用 browser_goto 直接导航到目标页面（路径必
 
 大数据处理策略：当 ac_api_call 返回"数据量较大，已缓存"时，先查看样例数据了解格式，
 然后用 search_data(keyword) 按关键词搜索。例如分析网关掉线，可搜索 "disconnected"。
+
+## AC 平台页面路由
+
+当确认需要 UI 操作时（API 无法完成的任务），使用 browser_goto 导航到目标页面（路径必须携带 ?view 后缀，否则会变成 API 调用）：
+
+- Dashboard (仪表盘): /dashboard?view
+- Gateways (网关列表): /ap?view
+- Devices (设备列表): /device?view
+- Events (事件日志): /event?view
+- Settings (系统设置): /setting?view
+- Firmware (固件管理): /firmware?view
 
 ## 行为规范
 
@@ -181,6 +185,8 @@ UI 操作时，优先使用 browser_goto 直接导航到目标页面（路径必
 
 {ac_api_summary}
 
+{gateway_api_summary}
+
 {cli_summary}
 
 ## eMMC 健康检查知识
@@ -195,6 +201,27 @@ eMMC 是网关使用的嵌入式存储，有磨损寿命。通过 `mmc extcsd re
 - **devName**: eMMC 芯片名称，用于区分厂家（如 8GTF4R、DG4008 等）
 - **风险阈值**: EST_TYP_A >= 7 需要重点关注
 - M/Z 系列网关为嵌入式系统，无 eMMC 存储，自动跳过
+
+## 测试用例生成
+
+当用户要求"生成测试用例"、"录制测试"、"创建回归测试"等:
+
+### 工作流程
+1. **执行操作**: 按照用户描述的测试场景执行操作。系统会自动记录每一步操作（UI 操作、SSH 命令、API 调用等）。
+2. **注重验证点**: 每步操作后仔细观察结果变化（URL 跳转、元素出现/消失、命令输出、API 响应），这些将成为测试断言的依据。
+3. **生成测试**: 操作完成后，调用 `generate_test(test_name, description)` 生成 pytest 测试文件，然后用 `done()` 报告结果。
+
+### 工具说明
+- `generate_test(test_name, description)`: 根据已记录的操作生成 pytest-playwright 测试文件
+  - `test_name`: 英文名称，如 login_success, add_gateway
+  - `description`: 说明测试场景和预期结果
+
+### 注意事项
+- 操作执行和 `generate_test` 必须在**同一轮对话**中完成（每轮开始时操作记录会自动重置）
+- 按任务需要选择工具（UI/SSH/API 均可），系统会自动记录所有操作类型并生成对应的测试代码
+- 先用 `generate_test()` 生成测试文件，再用 `done()` 报告结果（含文件路径和运行方式）
+- 如果用户没有明确说明验证点，根据操作的自然预期来判断（如登录后应跳转到仪表盘）
+- 如果用户只说"生成测试"但没有描述要测试什么场景，先询问具体的测试场景
 """
     return prompt.strip()
 
@@ -305,13 +332,78 @@ def _build_proxy_summary(proxy: dict) -> list[str]:
             if desc and proxied:
                 lines.append(f"- {desc}: `{proxied}`")
 
-    gateway_docs = proxy.get("gateway_api_docs", [])
-    if gateway_docs:
-        doc_names = ", ".join(gateway_docs)
-        lines.append("")
-        lines.append(f"参考网关 API 文档: {doc_names}")
-
     return lines
+
+
+def _load_gateway_api_summary() -> str:
+    """完整加载网关 HTTP API 文档（BLE API + 管理 API）。"""
+    specs = [
+        (
+            "cassia-spec/doc/http/cassia-gateway-http-api-basic.json",
+            "Cassia 网关 BLE HTTP API",
+        ),
+        (
+            "cassia-spec/doc/http/cassia-gateway-http-api-management.json",
+            "Cassia 网关管理 HTTP API",
+        ),
+    ]
+
+    sections: list[str] = []
+    for relative_path, title in specs:
+        spec_path = _find_spec_file(relative_path)
+        if not spec_path:
+            continue
+        try:
+            with open(spec_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+
+        apis = data.get("apis", [])
+        if not apis:
+            continue
+
+        non_sse_apis = []
+        for api in apis:
+            api.pop("curl_example", None)
+            desc = api.get("description", "")
+            if "Server-Sent Events (SSE) API" in desc:
+                continue
+            non_sse_apis.append(api)
+
+        apis_json = json.dumps(non_sse_apis, indent=2, ensure_ascii=False)
+        sections.append(f"### {title}\n\n```json\n{apis_json}\n```")
+
+    if not sections:
+        return ""
+
+    sse_note = (
+        "### SSE 流式 API 替代方案\n"
+        "\n"
+        "以下网关 API 是 SSE 流式长连接，不可通过 ac_api_call 调用（会挂住）。"
+        "请使用对应的替代方案：\n"
+        "\n"
+        "- **扫描附近设备** → ac_api_call(GET, /device) 获取 AC 已检测到的设备列表\n"
+        "- **查看已连接设备** → ac_api_call(GET, /api2/gap/nodes, "
+        'query="mac={MAC}&connection_state=connected")\n'
+        "- **获取设备 RSSI** → ac_api_call(GET, /api2/gap/nodes/{node}/rssi, "
+        'query="mac={MAC}")\n'
+        "- **监听通知数据** → 目前不支持实时流式监听，"
+        "可通过 ssh_to_gateway + run_gateway_command 使用 cassia CLI 替代"
+    )
+
+    lines = [
+        "",
+        "## Cassia 网关 HTTP API 参考",
+        "",
+        "以下是网关自身的 HTTP API，通过 ac_api_call 以 `/api2/` 代理模式调用"
+        "（需在 query 中带 mac 参数指定目标网关）:",
+        "",
+        "\n\n".join(sections),
+        "",
+        sse_note,
+    ]
+    return "\n".join(lines)
 
 
 def _load_cli_summary() -> str:

@@ -15,6 +15,8 @@ from openai import OpenAI
 from playwright.sync_api import Page
 
 from lib.snapshot import SnapshotParser
+from lib.recorder import ActionRecorder
+from lib.browser import login_ac
 from agent.tools import TOOL_DEFINITIONS, ToolExecutor
 from agent.prompts import build_system_prompt
 
@@ -54,6 +56,7 @@ class CassiaAgent:
         on_thinking_stream_end: Callable[[str], None] | None = None,
         on_reasoning_chunk: Callable[[str], None] | None = None,
         on_confirm_required: Callable[[str, dict, str], bool] | None = None,
+        on_tool_progress: Callable[[str], None] | None = None,
     ):
         """
         Args:
@@ -66,6 +69,7 @@ class CassiaAgent:
             on_thinking_stream_end: 流式结束回调 (full_content) — 流式完成后调用
             on_reasoning_chunk: reasoning 专用流式回调 — 有则优先使用，否则 fallback 到 on_thinking_chunk
             on_confirm_required: 确认回调 (tool_name, args, preview) -> bool — 高风险操作前请求用户确认
+            on_tool_progress: 工具内部进度回调 (text_chunk) — 用于测试生成等耗时工具的流式输出
         """
         self.page = page
         self.config = config
@@ -92,11 +96,21 @@ class CassiaAgent:
         diff_threshold = agent_config.get("diff_threshold", 0.6)
         snapshot_max_lines = agent_config.get("snapshot_max_lines", None)
         self.snapshot = SnapshotParser(diff_threshold=diff_threshold, max_lines=snapshot_max_lines)
-        self.executor = ToolExecutor(page, self.snapshot, config)
+        self.recorder = ActionRecorder()
+        self.executor = ToolExecutor(
+            page, self.snapshot, config,
+            recorder=self.recorder,
+            llm_client=self._client,
+            on_progress=on_tool_progress,
+        )
 
         # 对话历史
         self._system_prompt = build_system_prompt(config)
         self._messages: list[dict] = []
+
+        # 弹窗捕获: 存储最近的 dialog 消息，供下次观察时注入给 LLM
+        self._pending_dialogs: list[str] = []
+        self.page.on("dialog", self._on_page_dialog)
 
         # 回调
         self._on_thinking = on_thinking
@@ -106,6 +120,7 @@ class CassiaAgent:
         self._on_thinking_stream_end = on_thinking_stream_end
         self._on_reasoning_chunk = on_reasoning_chunk
         self._on_confirm_required = on_confirm_required
+        self._on_tool_progress = on_tool_progress
 
     def run(self, user_instruction: str) -> str:
         """
@@ -117,15 +132,22 @@ class CassiaAgent:
         Returns:
             任务完成的总结文本
         """
+        # 每轮指令重置录制（始终在记录，供 generate_test 工具按需使用）
+        self.recorder.reset()
+
+        # 会话保活: 检查是否被踢到登录页，如有需要则自动重新登录
+        self._ensure_session()
+
         # 获取初始页面快照
         observation = self.snapshot.get_observation(self.page)
 
         # 构建初始用户消息
+        dialog_text = self._consume_dialog_messages()
         user_message = f"""用户指令: {user_instruction}
 
 当前页面 URL: {self.page.url}
 
-{observation}"""
+{observation}{dialog_text}"""
 
         self._messages.append({"role": "user", "content": user_message})
         logger.info(f"[Agent] 用户指令: {user_instruction}")
@@ -209,10 +231,14 @@ class CassiaAgent:
 
                 # 获取操作后的页面状态
                 if tool_name.startswith("browser_") or tool_name == "ssh_to_gateway":
+                    self._ensure_session()
                     observation = self.snapshot.get_observation(self.page)
-                    result_with_observation = f"{result}\n\n当前页面 URL: {self.page.url}\n\n{observation}"
+                    dialog_text = self._consume_dialog_messages()
+                    result_with_observation = f"{result}\n\n当前页面 URL: {self.page.url}\n\n{observation}{dialog_text}"
+                    self.recorder.update_last_snapshot(observation)
                 else:
-                    result_with_observation = result
+                    dialog_text = self._consume_dialog_messages()
+                    result_with_observation = f"{result}{dialog_text}" if dialog_text else result
 
                 logger.info(f"[Agent] 工具结果: {tool_name} -> len={len(result)}")
                 logger.debug(f"[Agent] 工具结果详情: {result[:300]}")
@@ -246,6 +272,51 @@ class CassiaAgent:
         self.executor._ssh_connected = False
         self.executor._ws_polling_mode = False
         self.executor.cleanup()  # 清理临时缓存文件
+
+    def _on_page_dialog(self, dialog) -> None:
+        """Playwright dialog 事件回调 — 仅捕获弹窗消息供 LLM 感知。
+
+        不调用 dialog.accept() — lib/browser.py setup_interceptors 中
+        已注册的 handler 会负责关闭弹窗，避免重复 accept 导致异常。
+        """
+        msg = f"[{dialog.type}] {dialog.message}"
+        logger.warning(f"[Agent] 捕获弹窗: {msg}")
+        self._pending_dialogs.append(msg)
+
+    def _consume_dialog_messages(self) -> str:
+        """消费并返回所有待处理的弹窗消息文本，消费后清空缓冲。"""
+        if not self._pending_dialogs:
+            return ""
+        lines = ["\n[弹窗提示]"]
+        for msg in self._pending_dialogs:
+            lines.append(f"  {msg}")
+        self._pending_dialogs.clear()
+        return "\n".join(lines)
+
+    def _ensure_session(self) -> bool:
+        """
+        会话保活: 检测是否被重定向到登录页，如果是则自动重新登录。
+
+        当其他客户端登录踢掉当前 session，或 session 超时过期时，
+        AC 平台会将页面重定向到 /session?view（登录页）。
+        此方法透明地恢复会话，LLM 无感知。
+
+        Returns:
+            True 表示执行了重新登录，False 表示会话正常。
+        """
+        current_url = self.page.url
+        if "/session" not in current_url and "/login" not in current_url:
+            return False
+
+        logger.warning(f"[Agent] 检测到会话过期 (URL={current_url})，自动重新登录...")
+        try:
+            login_ac(self.page, self.config)
+            self.snapshot.reset()
+            logger.info("[Agent] 会话已自动恢复")
+            return True
+        except Exception as e:
+            logger.error(f"[Agent] 自动重新登录失败: {e}")
+            return False
 
     def _call_llm_stream(self) -> tuple[str | None, list[dict] | None, dict | None]:
         """
